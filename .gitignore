@@ -1,0 +1,23 @@
+# secrets: the Cohere key lives in .env, never in git
+.env
+.env.*
+
+# downloaded datasets, API responses and embeddings (rebuilt by the scripts). The repo is public: raw
+# Cohere outputs (vectors, response JSON, caches, the call ledger) stay local
+data/
+cache/
+vectors/
+probe_run/
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+*.npy
+*.npz
+.venv-*/
+
+.venv/
+__pycache__/
+*.pyc
+*.log
+.DS_Store

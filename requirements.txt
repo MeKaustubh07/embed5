@@ -1,0 +1,11 @@
+# Python 3.12 (rcp-ndcg needs >= 3.12):  uv venv --python 3.12 .venv && uv pip install -r requirements.txt
+cohere==7.2.0
+numpy==2.5.3
+pandas==3.0.6
+pyarrow==25.0.1
+huggingface-hub==1.33.0
+python-dotenv==1.2.4
+httpx==0.28.1
+# Cohere's RCP-nDCG scorer is not on PyPI yet (its README's `pip install rcp-ndcg` returns 404): pinned to a commit
+rcp-ndcg-core @ git+https://github.com/cohere-ai/rcp-ndcg@de900f35aee952b123ad790adcb19aa783e24656#subdirectory=packages/rcp-ndcg-core
+rcp-ndcg[hf] @ git+https://github.com/cohere-ai/rcp-ndcg@de900f35aee952b123ad790adcb19aa783e24656
