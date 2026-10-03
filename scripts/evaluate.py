@@ -1,15 +1,20 @@
 """Score every way of storing the index on what has been embedded so far: cache only, no API calls.
 
-For each set and language, every (index model, question model) pair that is embedded, at every dim, as float,
-binary (Hamming), binary_asym (float question vs the page's bits) and int8; plus two-stage search: a 32-byte binary
-first pass over every page, then the top n re-scored with a bigger vector. Metrics (src/metrics.py): RCP-nDCG@10
-with a shortlist (Cohere's protocol) and without (every page competes), human-graded qrel-nDCG@10 and recall@10/100
-over every page.
-Writes results/summary.csv (means; results/ is gitignored until Cohere OKs publishing) and cache/eval/<subset>.npz
-(per-question values, for confidence intervals). Usage: python scripts/evaluate.py [set ...]
+For each set and language, every embedded (index model, question model) pair:
+  single     the index as float / binary (Hamming) / binary_asym (float question vs the page's bits) at every dim,
+             and as the API's int8 at 2048 and 1024 (float question vs int8 page)
+  two-stage  a first pass over every page (32 B Hamming, 32 B binary_asym, 128 B Hamming) keeps the top `depth`
+             pages, which a bigger vector re-scores (float 2048, int8 2048, int8 1024). Depths are page counts and
+             shares of the set (the share is what carries to a bigger collection)
+Metrics (src/metrics.py): RCP- and qrel-nDCG@10 with the shortlist and over the corpus, never-judged pages in the
+corpus top 10, recall@10/100. Translated questions are also scored against their English original's judged pool
+(judged_by=english): each language's own pool was built partly by BM25, which barely works across languages.
+Writes results/summary.csv (gitignored until Cohere OKs publishing) and cache/eval/<subset>.npz (per question, for
+the clustered confidence intervals in scripts/stats.py). Usage: python scripts/evaluate.py [set ...]
 """
 import sys
 import time
+from functools import cache
 from pathlib import Path
 
 import numpy as np
@@ -22,7 +27,10 @@ import metrics  # noqa: E402
 import systems as sy  # noqa: E402
 
 RESULTS, PER_QUERY = ROOT / "results", ROOT / "cache" / "eval"
-FIRST_PASS_N = (100, 200)                  # pages kept by the 32-byte first pass for re-scoring
+FIRST_PASSES = {"binary256": ("binary", 256), "binary_asym256": ("binary_asym", 256), "binary1024": ("binary", 1024)}
+RESCORE_BYTES = {"float2048": 8192, "int8_2048": 2048, "int8_1024": 1024}
+DEPTHS = (10, 20, 50, 100, 200)
+DEPTH_SHARES = (0.01, 0.02, 0.05, 0.10)
 
 
 def try_cached(texts, model, input_type, dim=2048, types=sy.TYPES):
@@ -32,30 +40,36 @@ def try_cached(texts, model, input_type, dim=2048, types=sy.TYPES):
         return None
 
 
-def systems_for(P: dict, Q: dict, P1k: dict):
-    """-> [(row fields, score matrix)] for one set and language."""
+def systems_for(P: dict, Q: dict, P1k: dict, n_pages: int, two_stage: bool = True):
+    """-> [(row fields, build())] for one set and language; builds share their score matrices."""
+    @cache
+    def single(ip, qm, prec, d):
+        if prec == "int8" and d == 1024:
+            return sy.scores("int8", Q[qm], P1k[ip], 1024)
+        return sy.scores(prec, Q[qm], P[ip], d)
+
+    rescorers = {"float2048": ("float", 2048), "int8_2048": ("int8", 2048)}
+    depths = sorted(set(DEPTHS) | {max(1, round(f * n_pages)) for f in DEPTH_SHARES})
     out = []
     for ip in P:
         for qm in Q:
-            pair = {"index": ip, "query": qm}
-            for d in sy.DIMS:
-                for prec in ("float", "binary", "binary_asym"):
-                    out.append((pair | {"precision": prec, "dim": d, "stage": "single"},
-                                lambda ip=ip, qm=qm, d=d, prec=prec: sy.scores(prec, Q[qm], P[ip], d)))
-            out.append((pair | {"precision": "int8", "dim": 2048, "stage": "single"},
-                        lambda ip=ip, qm=qm: sy.scores("int8", Q[qm], P[ip], 2048)))
-            if ip in P1k:
-                out.append((pair | {"precision": "int8", "dim": 1024, "stage": "single"},
-                            lambda ip=ip, qm=qm: sy.scores("int8", Q[qm], P1k[ip], 1024)))
-            rescorers = {"float2048": lambda ip=ip, qm=qm: sy.scores("float", Q[qm], P[ip], 2048),
-                         "int8_2048": lambda ip=ip, qm=qm: sy.scores("int8", Q[qm], P[ip], 2048)}
-            if ip in P1k:
-                rescorers["int8_1024"] = lambda ip=ip, qm=qm: sy.scores("int8", Q[qm], P1k[ip], 1024)
-            for n in FIRST_PASS_N:
-                for rname, rescore in rescorers.items():
-                    out.append((pair | {"precision": "binary", "dim": 256, "stage": f"then {rname} on top {n}"},
-                                lambda ip=ip, qm=qm, n=n, rescore=rescore:
-                                sy.two_stage(sy.scores("binary", Q[qm], P[ip], 256), rescore(), n)))
+            base = {"index": ip, "query": qm, "rescorer": "", "disk_bytes": 0, "depth": 0}
+            cells = [(prec, d) for d in sy.DIMS for prec in ("float", "binary", "binary_asym")] + [("int8", 2048)]
+            cells += [("int8", 1024)] if ip in P1k else []
+            for prec, d in cells:
+                out.append((base | {"kind": "single", "precision": prec, "dim": d, "ram_bytes": sy.BYTES[prec](d)},
+                            lambda ip=ip, qm=qm, prec=prec, d=d: single(ip, qm, prec, d)))
+            if not two_stage:
+                continue
+            rs = rescorers | ({"int8_1024": ("int8", 1024)} if ip in P1k else {})
+            for fname, (fprec, fd) in FIRST_PASSES.items():
+                for rname, (rprec, rd) in rs.items():
+                    for n in depths:
+                        out.append(({"index": ip, "query": qm, "kind": "two-stage", "precision": fprec, "dim": fd,
+                                     "ram_bytes": sy.BYTES[fprec](fd), "rescorer": rname,
+                                     "disk_bytes": RESCORE_BYTES[rname], "depth": n},
+                                    lambda ip=ip, qm=qm, fprec=fprec, fd=fd, rprec=rprec, rd=rd, n=n: sy.two_stage(
+                                        single(ip, qm, fprec, fd), single(ip, qm, rprec, rd), n)))
     return out
 
 
@@ -69,21 +83,27 @@ def run_set(name: str) -> list[dict]:
         return []
     rows = []
     for lang in data.LANGS:
-        qs = metrics.QuerySet.load(name, lang, d)
         qtext = d.queries[d.queries.language == lang].text.tolist()
         Q = {m: v for m in sy.MODELS if (v := try_cached(qtext, m, "search_query")) is not None}
-        per_query = {}
-        for fields, build in systems_for(P, Q, P1k):
-            m = metrics.evaluate(build(), qs)
-            key = "|".join(str(fields[k]) for k in ("index", "query", "precision", "dim", "stage"))
-            per_query |= {f"{key}|{k}": v for k, v in m.items()}
-            rows.append({"set": name, "lang": lang, "subset": qs.subset, **fields,
-                         "bytes": sy.BYTES[fields["precision"]](fields["dim"]), "n_queries": len(qs.query_ids)}
-                        | {k: float(np.nanmean(v)) for k, v in m.items()})
-        PER_QUERY.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(PER_QUERY / f"{qs.subset}.npz", **per_query)
-        print(f"  {qs.subset:28s} {len(Q)} question model(s) x {len(P)} index model(s): {len(per_query) // 5} systems",
-              flush=True)
+        for judge in [None] + (["english"] if lang != "english" else []):
+            qs = metrics.QuerySet.load(name, lang, d, judged_by=judge)
+            per_query = {"__query_ids__": np.array(qs.query_ids), "__en_ids__": np.array(qs.en_ids)}
+            for fields, build in systems_for(P, Q, P1k, len(pages), two_stage=judge is None):
+                m = metrics.evaluate(build(), qs)
+                if fields["kind"] == "two-stage":           # the shortlist protocol does not apply to a first pass
+                    m["rcp_shortlist"][:] = m["qrel_shortlist"][:] = np.nan
+                key = "|".join(str(fields[k]) for k in ("index", "query", "kind", "precision", "dim", "rescorer",
+                                                       "depth"))
+                per_query |= {f"{key}|{k}": v for k, v in m.items()}
+                rows.append({"set": name, "lang": lang, "judged_by": judge or lang, "subset": qs.subset, **fields,
+                             "depth_share": fields["depth"] / len(pages), "n_pages": len(pages),
+                             "n_queries": len(qs.query_ids)} | {k: float(np.nanmean(v)) if np.isfinite(v).any()
+                                                                 else np.nan for k, v in m.items()})
+            PER_QUERY.mkdir(parents=True, exist_ok=True)
+            tag = qs.subset.replace(" (judged by english)", "__judged_by_english")
+            np.savez_compressed(PER_QUERY / f"{tag}.npz", **per_query)
+            print(f"  {qs.subset:44s} {len(Q)} x {len(P)} model pair(s): {(len(per_query) - 2) // 7} systems",
+                  flush=True)
     return rows
 
 
@@ -97,7 +117,8 @@ def main(sets: list[str]) -> None:
     out = RESULTS / "summary.csv"
     if out.exists():                       # keep the other sets' rows
         old = pd.read_csv(out)
-        df = pd.concat([old[~old.set.isin(df.set.unique())], df], ignore_index=True)
+        if "judged_by" in old:             # an older format is simply replaced
+            df = pd.concat([old[~old.set.isin(df.set.unique())], df], ignore_index=True)
     df.to_csv(out, index=False)
     print(f"{len(rows)} rows -> {out} ({time.monotonic() - t0:.0f} s)")
 

@@ -41,17 +41,21 @@ def ndcg(scores: np.ndarray, gains: np.ndarray, ideal: np.ndarray, k: int = 10) 
     return dcg / norm if norm > 0 else 0.0
 
 
-def recall(scores: np.ndarray, relevant: np.ndarray, k: int) -> float:
-    """Share of the relevant pages (bool mask) in the top k; a tie straddling the cutoff counts fractionally."""
-    n_rel = int(relevant.sum())
-    if n_rel == 0:
-        return float("nan")
+def topk_count(scores: np.ndarray, mask: np.ndarray, k: int) -> float:
+    """Expected number of masked pages in the top k: a tie straddling the cutoff counts fractionally (the
+    expectation over the tie's orders)."""
     if k >= len(scores):
-        return 1.0
+        return float(mask.sum())
     t = np.partition(scores, len(scores) - k)[len(scores) - k]
     above, at = scores > t, scores == t
     slots = k - int(above.sum())
-    return (float(relevant[above].sum()) + float(relevant[at].sum()) * slots / int(at.sum())) / n_rel
+    return float(mask[above].sum()) + float(mask[at].sum()) * slots / int(at.sum())
+
+
+def recall(scores: np.ndarray, relevant: np.ndarray, k: int) -> float:
+    """Share of the relevant pages (bool mask) in the top k, ties at the cutoff counted fractionally."""
+    n_rel = int(relevant.sum())
+    return topk_count(scores, relevant, k) / n_rel if n_rel else float("nan")
 
 
 @dataclass
@@ -66,43 +70,61 @@ class QuerySet:
     grade: np.ndarray           # [nq, n_pages] human grade (0/1/2; 0 for unjudged pages)
 
     @classmethod
-    def load(cls, domain: str, lang: str, d: "data.Domain | None" = None) -> "QuerySet":
+    def load(cls, domain: str, lang: str, d: "data.Domain | None" = None,
+             judged_by: str | None = None) -> "QuerySet":
+        """judged_by="english": a translated question is scored against its English original's pool and gains.
+        Each language's pool was built and judged on its own, partly by BM25, which barely works across
+        languages, so own-language pools differ (~70% overlap) and confound cross-language comparisons. The
+        human grades are the same in every language."""
         d = d or data.load(domain)
         pages = d.pages().id.tolist()
         col = {p: i for i, p in enumerate(pages)}
         q = d.queries[d.queries.language == lang]
-        qr = d.qrels[d.qrels.language == lang]
-        pools = d.pools[d.pools.language == lang].set_index("query-id")["corpus-ids"]
+        judge = judged_by or lang
+        qr = d.qrels[d.qrels.language == judge]
+        pools = d.pools[d.pools.language == judge].set_index("query-id")["corpus-ids"]
         gain = qr.set_index(["query-id", "corpus-id"]).gain
+        jid = q.id.tolist() if judge == lang else q.en_id.tolist()      # whose pool and gains each row uses
+        row = {j: i for i, j in enumerate(jid)}
         n = len(q)
         pool, pool_gain = np.zeros((n, 150), np.int64), np.zeros((n, 150))
         grade = np.zeros((n, len(pages)))
-        for i, qid in enumerate(q.id):
+        for i, qid in enumerate(jid):
             ids = list(pools[qid])
             assert len(ids) == 150 and all(p in col for p in ids), (qid, "pool page missing or empty")
             pool[i] = [col[p] for p in ids]
             pool_gain[i] = gain.loc[[(qid, p) for p in ids]].to_numpy()
         pos = qr[qr.score > 0]
         for qid, p, s in zip(pos["query-id"], pos["corpus-id"], pos.score):
-            grade[q.id.tolist().index(qid), col[p]] = s
-        return cls(data.subset(domain, lang), pages, q.id.tolist(), q.en_id.tolist(), pool, pool_gain, grade)
+            grade[row[qid], col[p]] = s
+        name = data.subset(domain, lang) + ("" if judge == lang else f" (judged by {judge})")
+        return cls(name, pages, q.id.tolist(), q.en_id.tolist(), pool, pool_gain, grade)
+
+
+METRICS = ("qrel_shortlist", "qrel_corpus", "rcp_shortlist", "rcp_corpus", "unjudged@10", "recall@10", "recall@100")
 
 
 def evaluate(S: np.ndarray, qs: QuerySet, k: int = 10, recall_at: tuple[int, ...] = (10, 100)) -> dict:
-    """Per-query metrics of a score matrix S [n_queries, n_pages] (higher = more similar):
-    rcp_shortlist, rcp_corpus, qrel_corpus (all @k) and recall@n (full corpus), each an array over queries."""
+    """Per-query metrics of a score matrix S [n_queries, n_pages] (higher = more similar), each an array over
+    queries: RCP- and qrel-nDCG@k with the shortlist and over the corpus, the number of never-judged pages in
+    the corpus top k (where the corpus RCP counts 0 and may undercount), and recall@n over the corpus."""
     assert S.shape == (len(qs.query_ids), len(qs.page_ids)), S.shape
     S = S.astype(np.float64)
-    out = {m: np.zeros(len(S)) for m in ("rcp_shortlist", "rcp_corpus", "qrel_corpus")}
+    out = {m: np.zeros(len(S)) for m in ("qrel_shortlist", "qrel_corpus", "rcp_shortlist", "rcp_corpus",
+                                         f"unjudged@{k}")}
     out |= {f"recall@{n}": np.zeros(len(S)) for n in recall_at}
     for i, s in enumerate(S):
-        pg = qs.pool_gain[i]
-        out["rcp_shortlist"][i] = ndcg(s[qs.pool[i]], pg, pg, k)
+        pool, pg, grade = qs.pool[i], qs.pool_gain[i], qs.grade[i]
+        ideal = grade[grade > 0]
+        out["rcp_shortlist"][i] = ndcg(s[pool], pg, pg, k)
+        out["qrel_shortlist"][i] = ndcg(s[pool], grade[pool], ideal, k)
         g = np.zeros(len(s))
-        g[qs.pool[i]] = pg
+        g[pool] = pg
         out["rcp_corpus"][i] = ndcg(s, g, pg, k)
-        grade = qs.grade[i]
-        out["qrel_corpus"][i] = ndcg(s, grade, grade[grade > 0], k)
+        out["qrel_corpus"][i] = ndcg(s, grade, ideal, k)
+        judged = np.zeros(len(s), bool)
+        judged[pool] = True
+        out[f"unjudged@{k}"][i] = topk_count(s, ~judged, k)
         for n in recall_at:
             out[f"recall@{n}"][i] = recall(s, grade > 0, n)
     return out

@@ -28,7 +28,7 @@ def check(cond, what):
 
 print("query by query against rcp_ndcg_core.protocol.score_query")
 rng = np.random.default_rng(0)
-worst = {"shortlist": 0.0, "corpus": 0.0, "qrel": 0.0, "recall": 0.0}
+worst = {"shortlist": 0.0, "corpus": 0.0, "qrel": 0.0, "qrel_short": 0.0, "recall": 0.0, "unjudged": 0.0}
 for case in range(1200):
     n = int(rng.integers(150, 600))
     ids = [f"corpus-test-{i}" for i in range(n)]
@@ -56,6 +56,9 @@ for case in range(1200):
     worst["shortlist"] = max(worst["shortlist"], abs(metrics.ndcg(s[pool], pool_gain, pool_gain, k) - ref_short))
     worst["corpus"] = max(worst["corpus"], abs(metrics.ndcg(s, g_all, pool_gain, k) - ref_corpus))
     worst["qrel"] = max(worst["qrel"], abs(metrics.ndcg(s, grade, grade[grade > 0], k) - ref_qrel))
+    ref_qs = score_query(scores, {ids[p]: grade[p] for p in pool}, protocol="vidore", k=k, metric="qrel_ndcg",
+                         candidates=cand)
+    worst["qrel_short"] = max(worst["qrel_short"], abs(metrics.ndcg(s[pool], grade[pool], grade[grade > 0], k) - ref_qs))
     # recall: the expectation over random orders of the straddling tie, by brute force on a small case
     if case < 60:
         rel = grade > 0
@@ -63,10 +66,28 @@ for case in range(1200):
         perms = [np.lexsort((rng.random(n), -s))[:kk] for _ in range(4000)]
         mc = np.mean([rel[p].sum() / rel.sum() for p in perms])
         worst["recall"] = max(worst["recall"], abs(metrics.recall(s, rel, kk) - mc))
+        outside = np.ones(n, bool)
+        outside[pool] = False
+        mc = np.mean([outside[p].sum() for p in perms])
+        worst["unjudged"] = max(worst["unjudged"], abs(metrics.topk_count(s, outside, kk) - mc))
 check(worst["shortlist"] < 1e-12, f"shortlist (vidore) RCP-nDCG identical (max diff {worst['shortlist']:.1e})")
 check(worst["corpus"] < 1e-12, f"corpus (plain) RCP-nDCG identical (max diff {worst['corpus']:.1e})")
 check(worst["qrel"] < 1e-12, f"qrel-nDCG identical (max diff {worst['qrel']:.1e})")
+check(worst["qrel_short"] < 1e-12, f"qrel-nDCG with the shortlist identical (max diff {worst['qrel_short']:.1e})")
 check(worst["recall"] < 0.02, f"fractional recall = the expectation over tie orders (max diff {worst['recall']:.3f})")
+check(worst["unjudged"] < 0.1, f"never-judged pages in the top 10 = the expectation over tie orders "
+                               f"(max diff {worst['unjudged']:.3f} pages)")
+
+print("judging a translation by its English original")
+en, de_own = metrics.QuerySet.load("hr", "english"), metrics.QuerySet.load("hr", "german")
+de_en = metrics.QuerySet.load("hr", "german", judged_by="english")
+row = {q: i for i, q in enumerate(en.query_ids)}
+idx = [row[e] for e in de_en.en_ids]
+check(np.array_equal(de_en.pool, en.pool[idx]) and np.array_equal(de_en.pool_gain, en.pool_gain[idx]),
+      "each German question gets its English original's pool and gains")
+check(np.array_equal(de_en.grade, de_own.grade) and np.array_equal(de_own.grade, en.grade[idx]),
+      "human grades are the same whichever language judges")
+check(not np.array_equal(de_own.pool, de_en.pool), "while the own-language pools differ")
 
 print("Cohere's stored runs reproduce rcp-ndcg's published numbers")
 os.environ.setdefault("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1")

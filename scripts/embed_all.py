@@ -28,7 +28,9 @@ VECTOR_TYPES = ("float", "int8", "ubinary")
 
 
 def chunks(with_fast_int8: bool = False) -> list[tuple[str, str, str]]:
-    out = [(s, m, "vectors") for m in ("pro", "fast") for s in SETS] + [(s, "pro", "int8-1024") for s in SETS]
+    # Pro first, then its int8-1024 (the recommended re-scorer, so the headline two-stage runs on it), then Fast
+    out = [(s, "pro", "vectors") for s in SETS] + [(s, "pro", "int8-1024") for s in SETS]
+    out += [(s, "fast", "vectors") for s in SETS]
     return out + ([(s, "fast", "int8-1024") for s in SETS] if with_fast_int8 else [])
 
 
