@@ -60,13 +60,23 @@ def binary_asym(qf: np.ndarray, pb: np.ndarray, d: int) -> np.ndarray:
     return renorm(qf[:, :d]) @ signs.T
 
 
+def quantize(qf: np.ndarray, d: int = 256) -> np.ndarray:
+    """Questions [n, >= d] renormalized at d (in float64) and quantized to integers in [-127, 127], int32 [n, d].
+    The one quantizer of both the CPU reference and the GPU kernel: a float32 renormalization rounds 45 of the
+    5,052 real questions to a different integer somewhere."""
+    q = np.atleast_2d(qf)[:, :d].astype(np.float64)
+    norm = np.linalg.norm(q, axis=1, keepdims=True)
+    if (norm == 0).any():
+        raise ValueError("a question vector of all zeros has no direction")
+    q = q / norm
+    return np.round(q / np.abs(q).max(1, keepdims=True) * 127).astype(np.int32)
+
+
 def binary_asym8(qf: np.ndarray, pb: np.ndarray, d: int) -> np.ndarray:
-    """sum_d qi_d * bit_d with the question renormalized at d and quantized to [-127, 127]: it ranks like
-    qi . (+-1) (they differ by sum(qi), a constant per question), integers like the GPU kernel's."""
-    q = renorm(qf[:, :d]).astype(np.float64)
-    qi = np.round(q / np.abs(q).max(1, keepdims=True) * 127)
+    """sum_d qi_d * bit_d with the question quantized by quantize(): it ranks like qi . (+-1) (they differ by
+    sum(qi), a constant per question), integers like the GPU kernel's."""
     bits = np.unpackbits(pb[:, :d // 8], axis=1).astype(np.float64)
-    return qi @ bits.T
+    return quantize(qf, d).astype(np.float64) @ bits.T
 
 
 def int8_dot(qi: np.ndarray, pi: np.ndarray) -> np.ndarray:

@@ -8,6 +8,7 @@ Contrasts (per set):
              never-judged pages as 0, so the RCP gap is an upper bound and the qrel gap (human grades) is exact
   gap_excess the gap minus the full-float gap: the part that comes from the compression
   vs_float   a system's corpus nDCG@10 minus the full-float index's (two-stage and binary_asym rows)
+  vs_rescorer a two-stage system minus its re-scorer scoring every page: the cost of the first pass alone
 Writes results/stats.csv. Usage: python scripts/stats.py [set ...]
 """
 import sys
@@ -46,17 +47,22 @@ def contrasts(z: dict) -> dict[str, dict[str, np.ndarray]]:
     out = {}
     f = {m: z[f"{FLOAT}|{m}"] for m in ("qrel_shortlist", "qrel_corpus", "rcp_shortlist", "rcp_corpus")}
     for prec, d in (("float", 2048), ("int8", 2048), ("binary", 2048), ("binary", 1024), ("binary", 512),
-                    ("binary", 256), ("binary_asym", 256)):
+                    ("binary", 256), ("binary_asym", 256), ("binary_asym8", 256)):
         k = f"pro|pro|single|{prec}|{d}||0"
         for m in ("qrel", "rcp"):
             gap = z[f"{k}|{m}_shortlist"] - z[f"{k}|{m}_corpus"]
             out.setdefault(f"gap {prec} {d}", {})[m] = gap
             out.setdefault(f"gap_excess {prec} {d}", {})[m] = gap - (f[f"{m}_shortlist"] - f[f"{m}_corpus"])
             out.setdefault(f"vs_float {prec} {d}", {})[m] = z[f"{k}|{m}_corpus"] - f[f"{m}_corpus"]
+    alone = {"float2048": "pro|pro|single|float|2048||0", "int8_2048": "pro|pro|single|int8|2048||0",
+             "int8_1024": "pro|pro|single|int8|1024||0"}
     for key in [k[:-len("|qrel_corpus")] for k in z if k.endswith("|qrel_corpus") and "|two-stage|" in k]:
         _, _, _, prec, d, rescorer, depth = key.split("|")
-        name = f"vs_float {prec}{d} -> {rescorer} top {depth}"
-        out[name] = {m: z[f"{key}|{m}_corpus"] - f[f"{m}_corpus"] for m in ("qrel", "rcp")}
+        name = f"{prec}{d} -> {rescorer} top {depth}"
+        out[f"vs_float {name}"] = {m: z[f"{key}|{m}_corpus"] - f[f"{m}_corpus"] for m in ("qrel", "rcp")}
+        # against the re-scorer scoring every page: what the first pass alone costs
+        out[f"vs_rescorer {name}"] = {m: z[f"{key}|{m}_corpus"] - z[f"{alone[rescorer]}|{m}_corpus"]
+                                      for m in ("qrel", "rcp")}
     return out
 
 

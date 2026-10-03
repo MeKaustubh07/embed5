@@ -3,7 +3,7 @@
 For each question (English, Pro index and Pro questions), a collection of N pages: its human-relevant pages plus
 random other pages. Up to the size of its own set the others come from that set (similar documents: the hard
 case); beyond it, pages of the other sets are added (different topics: easier distractors). At each N, for each
-first pass (32 B Hamming, 32 B against the float question) and depth n: the human-graded nDCG@10 after re-scoring
+first pass (32 B Hamming, 32 B against the float question and against its 8-bit version) and depth n: the human-graded nDCG@10 after re-scoring
 the top n with int8 2048, against full float on the same collection, and the first pass's recall@n. Five random
 collections per size, the same ones for every system. Writes results/sweep.csv. Usage: python scripts/sweep.py
 """
@@ -43,7 +43,8 @@ def run_set(name: str, others: list[str]) -> list[dict]:
     Q = sy.cached(d.queries[d.queries.language == "english"].text.tolist(), "pro", "search_query")
     full = {"float": sy.cosine(Q["float"], allP["float"], 2048), "int8": sy.scores("int8", Q, allP, 2048),
             "binary256": sy.hamming(Q["ubinary"], allP["ubinary"], 256),
-            "binary_asym256": sy.binary_asym(Q["float"], allP["ubinary"], 256)}
+            "binary_asym256": sy.binary_asym(Q["float"], allP["ubinary"], 256),
+            "binary_asym8_256": sy.binary_asym8(Q["float"], allP["ubinary"], 256)}
     sizes = [n for n in WITHIN if n < n_own] + [n_own] + [n for n in (2 * n_own, 4 * n_own) if n < n_all] + [n_all]
     sizes = sorted(set(s for s in sizes if s > 0))
     rng = np.random.default_rng(SEED)
@@ -68,7 +69,7 @@ def run_set(name: str, others: list[str]) -> list[dict]:
                 f = full["float"][i, pick]
                 acc.setdefault(("float", 0), []).append(metrics.ndcg(f, g, ideal))
                 r8 = full["int8"][i, pick]
-                for fp in ("binary256", "binary_asym256"):
+                for fp in ("binary256", "binary_asym256", "binary_asym8_256"):
                     first = full[fp][i, pick]
                     order = np.argsort(-first, kind="stable")
                     for n in sorted(set(DEPTHS) | {max(1, round(s * N)) for s in DEPTH_SHARES}):

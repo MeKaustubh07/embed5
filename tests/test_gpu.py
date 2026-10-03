@@ -33,9 +33,24 @@ for k in (1, 100, 1000):
     idx, d = index.topk(q, k)
     want = np.lexsort((np.arange(N), ref))[:k]
     check(np.array_equal(idx, want) and np.array_equal(d, ref[want]), f"top-{k} exact, ties broken by page index")
+check(index.fallbacks == 0, "no CPU fallback when the candidates fit")
 small = gpu.Index(codes, cap=64)                                # 301 pages tie at the cut: more than cap
 idx, d = small.topk(q, 100)
-check(np.array_equal(idx, np.lexsort((np.arange(N), ref))[:100]), "candidate overflow falls back, still exact")
+check(np.array_equal(idx, np.lexsort((np.arange(N), ref))[:100]) and small.fallbacks == 1,
+      "candidate overflow falls back (and is counted), still exact")
+for bad in (0, -1):
+    try:
+        index.topk(q, bad)
+        raised = False
+    except ValueError:
+        raised = True
+    check(raised, f"k={bad} is refused")
+try:
+    gpu.quantize(np.zeros(2048, np.float32))
+    raised = False
+except ValueError:
+    raised = True
+check(raised, "an all-zero question is refused")
 qf = rng.standard_normal(2048).astype(np.float32)
 signs = np.unpackbits(codes, axis=1).astype(np.float64) * 2 - 1
 want = signs @ (qf[:256] / np.linalg.norm(qf[:256]))
@@ -43,6 +58,18 @@ got = index.asym_scores(qf)
 check(np.abs(got - want).max() < 1e-4, f"asym scores = numpy (max diff {np.abs(got - want).max():.1e})")
 idx, v = index.asym_topk(qf, 100)
 check(set(idx) == set(np.argsort(-want)[:100]), "asym top-100 = numpy's")
+
+print("8 questions per pass")
+qs = np.stack([codes[rng.integers(N)] ^ np.where(rng.random(32) < 0.05, 1, 0).astype(np.uint8) for _ in range(19)])
+qs[3] = q                                                       # the heavily tied question from above
+batch = index.topk_batch(qs, 100)
+single = [index.topk(x, 100) for x in qs]
+check(len(batch) == 19 and all(np.array_equal(a[0], b[0]) and np.array_equal(a[1], b[1]) for a, b in zip(batch, single)),
+      "19 questions (two full passes and a partial one) == one at a time, exactly")
+mid = gpu.Index(codes, cap=200)                                 # k=100 fits, the 301-way tie of qs[3] does not
+b_mid = mid.topk_batch(qs[:5], 100)
+check(all(np.array_equal(a[0], b[0]) for a, b in zip(b_mid, single[:5])) and mid.fallbacks == 1,
+      "only the batched question over the candidate cap falls back, and all stay exact")
 
 print("the bit-serial asym kernel (8-bit question, radix select)")
 ref8 = sy.binary_asym8(qf[None], codes, 256)[0].astype(np.int64)
@@ -56,7 +83,8 @@ tied[rng.choice(N, 5000, replace=False)] = codes[np.argmax(ref8)]     # 5,001 pa
 tix = gpu.Index(tied, cap=1024)
 r8 = sy.binary_asym8(qf[None], tied, 256)[0].astype(np.int64)
 idx, sc = tix.asym_bits_topk(qf, 100)
-check(np.array_equal(idx, np.lexsort((np.arange(N), -r8))[:100]), "a tie over the candidate cap falls back, still exact")
+check(np.array_equal(idx, np.lexsort((np.arange(N), -r8))[:100]) and tix.fallbacks == 1,
+      "a tie over the candidate cap falls back (counted), still exact")
 
 print("real Embed 5 codes (hr, English questions, Pro)")
 import data  # noqa: E402
@@ -77,4 +105,9 @@ check(ok_8, "GPU bit-serial == the CPU binary_asym8 scores, 40 questions")
 top = lambda S, i: set(np.argsort(-S[i], kind="stable")[:100])
 overlap = np.mean([len(top(cpu_a8, i) & top(cpu_a, i)) / 100 for i in range(40)])
 check(overlap > 0.95, f"the 8-bit question keeps {overlap:.1%} of the float question's top-100")
+allq = np.concatenate([sy.cached(data.load(s_).queries.text.tolist(), "pro", "search_query",
+                                 types=("float",))["float"][:, :256] for s_ in data.DOMAINS]
+                      + [rng.standard_normal((20_000, 256)).astype(np.float32)])
+same = all(np.array_equal(gpu.quantize(v), row) for v, row in zip(allq, sy.quantize(allq, 256)))
+check(same, f"the GPU and the CPU quantize all {len(allq):,} questions identically (real and random)")
 print(f"{passed} checks passed")

@@ -3,7 +3,8 @@
 For each set and language, every embedded (index model, question model) pair:
   single     the index as float / binary (Hamming) / binary_asym (float question vs the page's bits) at every dim,
              and as the API's int8 at 2048 and 1024 (float question vs int8 page)
-  two-stage  a first pass over every page (32 B Hamming, 32 B binary_asym, 128 B Hamming) keeps the top `depth`
+  two-stage  a first pass over every page (32 B Hamming, 32 B binary_asym with the float or the 8-bit question, 128 B
+             Hamming) keeps the top `depth`
              pages, which a bigger vector re-scores (float 2048, int8 2048, int8 1024). Depths are page counts and
              shares of the set (the share is what carries to a bigger collection)
 Metrics (src/metrics.py): RCP- and qrel-nDCG@10 with the shortlist and over the corpus, never-judged pages in the
@@ -27,7 +28,8 @@ import metrics  # noqa: E402
 import systems as sy  # noqa: E402
 
 RESULTS, PER_QUERY = ROOT / "results", ROOT / "cache" / "eval"
-FIRST_PASSES = {"binary256": ("binary", 256), "binary_asym256": ("binary_asym", 256), "binary1024": ("binary", 1024)}
+FIRST_PASSES = {"binary256": ("binary", 256), "binary_asym256": ("binary_asym", 256),
+                "binary_asym8_256": ("binary_asym8", 256), "binary1024": ("binary", 1024)}
 RESCORE_BYTES = {"float2048": 8192, "int8_2048": 2048, "int8_1024": 1024}
 DEPTHS = (10, 20, 50, 100, 200)
 DEPTH_SHARES = (0.01, 0.02, 0.05, 0.10)
@@ -55,6 +57,7 @@ def systems_for(P: dict, Q: dict, P1k: dict, n_pages: int, two_stage: bool = Tru
         for qm in Q:
             base = {"index": ip, "query": qm, "rescorer": "", "disk_bytes": 0, "depth": 0}
             cells = [(prec, d) for d in sy.DIMS for prec in ("float", "binary", "binary_asym")] + [("int8", 2048)]
+            cells += [("binary_asym8", 256)]                   # what the GPU's bit-serial kernel computes
             cells += [("int8", 1024)] if ip in P1k else []
             for prec, d in cells:
                 out.append((base | {"kind": "single", "precision": prec, "dim": d, "ram_bytes": sy.BYTES[prec](d)},

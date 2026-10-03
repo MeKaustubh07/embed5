@@ -63,6 +63,57 @@ kernel void compact(device const ushort* dist [[buffer(0)]], device uint* state 
     }
 }
 
+// ---- Hamming top-k for up to 8 questions per pass: each page's code is read once for all of them ----
+// distances [Q, N]; state per question q at q * stride: the 257-bin histogram, threshold, count, candidate pairs
+// (the layout of the single-question state, repeated)
+
+kernel void hamming8_hist(device ushort* out [[buffer(0)]], device const uint4* codes [[buffer(1)]],
+                          constant uint4* q [[buffer(2)]], device atomic_uint* state [[buffer(3)]],
+                          constant uint& N [[buffer(4)]], constant uint& Q [[buffer(5)]],
+                          constant uint& stride [[buffer(6)]],
+                          uint i [[thread_position_in_grid]], uint t [[thread_index_in_threadgroup]],
+                          uint tg [[threads_per_threadgroup]]) {
+    threadgroup atomic_uint h[8 * NBINS];
+    for (uint b = t; b < Q * NBINS; b += tg) atomic_store_explicit(&h[b], 0u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (i < N) {
+        uint4 a = codes[2 * i], b = codes[2 * i + 1];
+        for (uint k = 0; k < Q; k++) {
+            uint d = pc4(a ^ q[2 * k]) + pc4(b ^ q[2 * k + 1]);
+            out[k * N + i] = ushort(d);
+            atomic_fetch_add_explicit(&h[k * NBINS + d], 1u, memory_order_relaxed);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint b = t; b < Q * NBINS; b += tg) {
+        uint c = atomic_load_explicit(&h[b], memory_order_relaxed);
+        if (c) atomic_fetch_add_explicit(&state[(b / NBINS) * stride + b % NBINS], c, memory_order_relaxed);
+    }
+}
+
+kernel void kth8(device uint* state [[buffer(0)]], constant uint& K [[buffer(1)]], constant uint& Q [[buffer(2)]],
+                 constant uint& stride [[buffer(3)]], uint t [[thread_position_in_grid]]) {
+    if (t >= Q) return;
+    device uint* s = state + t * stride;
+    uint acc = 0, b = 0;
+    for (; b < NBINS; b++) { acc += s[b]; if (acc >= K) break; }
+    s[NBINS] = min(b, NBINS - 1);
+}
+
+kernel void compact8(device const ushort* dist [[buffer(0)]], device uint* state [[buffer(1)]],
+                     constant uint& N [[buffer(2)]], constant uint& Q [[buffer(3)]], constant uint& CAP [[buffer(4)]],
+                     constant uint& stride [[buffer(5)]], uint i [[thread_position_in_grid]]) {
+    if (i >= N) return;
+    for (uint k = 0; k < Q; k++) {
+        device uint* s = state + k * stride;
+        uint d = dist[k * N + i];
+        if (d <= s[NBINS]) {
+            uint slot = atomic_fetch_add_explicit((device atomic_uint*)&s[NBINS + 1], 1u, memory_order_relaxed);
+            if (slot < CAP) { s[CAND0 + 2 * slot] = i; s[CAND0 + 2 * slot + 1] = d; }
+        }
+    }
+}
+
 // ---- the float question against the page's bits, bit-serial ----
 // The question quantized to qi in [-127, 127], stored as u = qi + 128 in 8 bit-planes laid out like the codes.
 // sum_d qi_d * (+-1)_d ranks like sum_d qi_d * bit_d (the rest is a constant per question), and

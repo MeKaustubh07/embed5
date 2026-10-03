@@ -2,6 +2,7 @@
 torch.mps.compile_shader, the way the metal-inference-engine compiles its kernels.
 
   Index(codes).topk(q, k)        exact top-k by Hamming distance (counting select), ties by page index
+  Index(codes).topk_batch(qs, k) the same for many questions, 8 per pass over the codes
   Index(codes).asym_bits_topk(qf, k)  the same with the question quantized to 8 bits: bit-serial AND+popcount
                                       and an exact two-level radix select (the fast path)
   Index(codes).asym_topk(qf, k)       top-k by the float question against the page's bits (+-1) through a lookup
@@ -11,6 +12,8 @@ from pathlib import Path
 
 import numpy as np
 import torch
+
+import systems
 
 ROOT = Path(__file__).resolve().parents[1]
 DEV = torch.device("mps")
@@ -26,16 +29,17 @@ def lut(qf: np.ndarray) -> np.ndarray:
     j, i.e. sum over its 8 bits of q[8 j + b] * (+1 if the bit is set else -1). Bits are MSB first, as in ubinary.
     qf: the question's first 256 float values (renormalized here, as a 256-dim vector)."""
     q = qf[:256].astype(np.float64)
+    if not np.linalg.norm(q) > 0:
+        raise ValueError("a question vector of all zeros has no direction")
     q = (q / np.linalg.norm(q)).reshape(32, 8)
     bits = np.unpackbits(np.arange(256, dtype=np.uint8)[:, None], axis=1).astype(np.float64) * 2 - 1   # [256, 8]
     return (q @ bits.T).astype(np.float32).reshape(-1)                                                # [32, 256]
 
 
 def quantize(qf: np.ndarray) -> np.ndarray:
-    """The question's first 256 values, renormalized, as integers in [-127, 127] (int32 [256])."""
-    q = qf[:256].astype(np.float64)
-    q = q / np.linalg.norm(q)
-    return np.round(q / np.abs(q).max() * 127).astype(np.int32)
+    """The question's first 256 values as integers in [-127, 127] (int32 [256]): systems.quantize, the same
+    quantizer as the CPU reference."""
+    return systems.quantize(qf, 256)[0]
 
 
 def planes(qi: np.ndarray) -> np.ndarray:
@@ -49,6 +53,7 @@ class Index:
         """codes: uint8 [N, 32], the pages' 256-bit ubinary codes."""
         assert codes.dtype == np.uint8 and codes.ndim == 2 and codes.shape[1] == 32, codes.shape
         self.n, self.cap = len(codes), cap
+        self.fallbacks = 0                     # times a huge tie at the cut sent the selection to the CPU
         self.codes = torch.from_numpy(np.ascontiguousarray(codes).view(np.int32)).to(DEV)     # [N, 8]
         self.dist = torch.empty(self.n, dtype=torch.int16, device=DEV)
         self.scores = torch.empty(self.n, dtype=torch.float32, device=DEV)
@@ -68,7 +73,9 @@ class Index:
     def topk(self, q: np.ndarray, k: int = 100) -> tuple[np.ndarray, np.ndarray]:
         """Exact top-k (smallest distances), ordered by (distance, page index). Three kernels and one readback of
         the small candidate list; if more than `cap` pages tie at the cut, the distances are read back instead."""
-        k = min(k, self.n)
+        k = min(int(k), self.n)
+        if k < 1:
+            raise ValueError(f"k must be at least 1, got {k}")
         self.state[:NBINS + 2].zero_()
         LIB.hamming_hist(self.dist, self.codes, self._q(q), self.state, self.n, threads=self.n, group_size=TG)
         LIB.kth(self.state, k, threads=1, group_size=1)
@@ -76,6 +83,7 @@ class Index:
         s = self.state.cpu().numpy()
         count = int(s[NBINS + 1])
         if count > self.cap:                                    # a huge tie at the cut: do it on the CPU, exactly
+            self.fallbacks += 1
             d = self.dist.cpu().numpy().astype(np.int32)
             cand = np.flatnonzero(d <= s[NBINS])
             pairs = np.stack([cand, d[cand]], 1)
@@ -107,7 +115,9 @@ class Index:
         """Exact top-k (highest sum_d qi_d * bit_d), ordered by (score descending, page index): the scan with a
         high-byte histogram, the threshold bucket, a low-byte histogram inside it, the exact threshold, then a
         compaction; one readback of the candidates."""
-        k = min(k, self.n)
+        k = min(int(k), self.n)
+        if k < 1:
+            raise ValueError(f"k must be at least 1, got {k}")
         pl = torch.from_numpy(planes(quantize(qf)).view(np.int32).copy()).to(DEV)
         self.astate[:AS_CAND].zero_()
         LIB.asym_bits(self.scores16, self.codes, pl, self.astate, self.n, threads=self.n, group_size=TG)
@@ -118,6 +128,7 @@ class Index:
         s = self.astate.cpu().numpy()
         count = int(s[AS_COUNT])
         if count > self.cap:                                    # a huge tie at the threshold: exact, on the CPU
+            self.fallbacks += 1
             sc = self.scores16.cpu().numpy().astype(np.int64)
             cand = np.flatnonzero(sc >= s[AS_T])
             pairs = np.stack([cand, sc[cand]], 1)
@@ -125,3 +136,38 @@ class Index:
             pairs = s[AS_CAND:AS_CAND + 2 * count].reshape(count, 2).astype(np.int64)
         order = np.lexsort((pairs[:, 0], -pairs[:, 1]))[:k]
         return pairs[order, 0], pairs[order, 1]
+
+    def topk_batch(self, qs: np.ndarray, k: int = 100) -> list[tuple[np.ndarray, np.ndarray]]:
+        """topk() for every row of qs (uint8 [Q, 32]), 8 questions per pass: each page's code is read once for
+        8 questions instead of once per question. Same results as topk(), question by question."""
+        k = min(int(k), self.n)
+        if k < 1:
+            raise ValueError(f"k must be at least 1, got {k}")
+        stride = CAND0 + 2 * self.cap
+        if not hasattr(self, "dist8"):
+            self.dist8 = torch.empty(8 * self.n, dtype=torch.int16, device=DEV)
+            self.state8 = torch.zeros(8 * stride, dtype=torch.int32, device=DEV)
+        out = []
+        for lo in range(0, len(qs), 8):
+            block = np.ascontiguousarray(qs[lo:lo + 8])
+            nq = len(block)
+            qt = torch.from_numpy(block.view(np.int32).copy()).to(DEV)
+            self.state8.view(8, stride)[:, :NBINS + 2].zero_()
+            LIB.hamming8_hist(self.dist8, self.codes, qt, self.state8, self.n, nq, stride, threads=self.n,
+                              group_size=TG)
+            LIB.kth8(self.state8, k, nq, stride, threads=nq, group_size=nq)
+            LIB.compact8(self.dist8, self.state8, self.n, nq, self.cap, stride, threads=self.n, group_size=TG)
+            st = self.state8.cpu().numpy().reshape(8, stride)
+            for j in range(nq):
+                s = st[j]
+                count = int(s[NBINS + 1])
+                if count > self.cap:                            # a huge tie at the cut: exact, on the CPU
+                    self.fallbacks += 1
+                    d = self.dist8[j * self.n:(j + 1) * self.n].cpu().numpy().astype(np.int32)
+                    cand = np.flatnonzero(d <= s[NBINS])
+                    pairs = np.stack([cand, d[cand]], 1)
+                else:
+                    pairs = s[CAND0:CAND0 + 2 * count].reshape(count, 2).astype(np.int64)
+                order = np.lexsort((pairs[:, 0], pairs[:, 1]))[:k]
+                out.append((pairs[order, 0], pairs[order, 1]))
+        return out
