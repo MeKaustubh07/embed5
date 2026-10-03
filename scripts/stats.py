@@ -9,6 +9,7 @@ Contrasts (per set):
   gap_excess the gap minus the full-float gap: the part that comes from the compression
   vs_float   a system's corpus nDCG@10 minus the full-float index's (two-stage and binary_asym rows)
   vs_rescorer a two-stage system minus its re-scorer scoring every page: the cost of the first pass alone
+  mix        an (index model, question model) pair minus Pro index + Pro question at the same storage
 Writes results/stats.csv. Usage: python scripts/stats.py [set ...]
 """
 import sys
@@ -54,9 +55,19 @@ def contrasts(z: dict) -> dict[str, dict[str, np.ndarray]]:
             out.setdefault(f"gap {prec} {d}", {})[m] = gap
             out.setdefault(f"gap_excess {prec} {d}", {})[m] = gap - (f[f"{m}_shortlist"] - f[f"{m}_corpus"])
             out.setdefault(f"vs_float {prec} {d}", {})[m] = z[f"{k}|{m}_corpus"] - f[f"{m}_corpus"]
+    # Pro/Fast mixing: each (index, question) model pair minus Pro index + Pro question, at the same storage
+    for prec, d in (("float", 2048), ("int8", 2048), ("float", 256), ("binary", 2048), ("binary", 1024),
+                    ("binary", 256), ("binary_asym8", 256)):
+        pp = f"pro|pro|single|{prec}|{d}||0"
+        for ip, qm in (("pro", "fast"), ("fast", "pro"), ("fast", "fast")):
+            k = f"{ip}|{qm}|single|{prec}|{d}||0"
+            if f"{k}|qrel_corpus" in z:
+                out[f"mix {ip} index, {qm} question, {prec} {d}"] = {
+                    m: z[f"{k}|{m}_corpus"] - z[f"{pp}|{m}_corpus"] for m in ("qrel", "rcp")}
     alone = {"float2048": "pro|pro|single|float|2048||0", "int8_2048": "pro|pro|single|int8|2048||0",
              "int8_1024": "pro|pro|single|int8|1024||0"}
-    for key in [k[:-len("|qrel_corpus")] for k in z if k.endswith("|qrel_corpus") and "|two-stage|" in k]:
+    two_stage = [k[:-len("|qrel_corpus")] for k in z if k.endswith("|qrel_corpus") and k.startswith("pro|pro|two-stage|")]
+    for key in two_stage:                     # Pro index + Pro questions only (the names carry no model pair)
         _, _, _, prec, d, rescorer, depth = key.split("|")
         name = f"{prec}{'_' if prec[-1].isdigit() else ''}{d} -> {rescorer} top {depth}"   # binary_asym8_256
         out[f"vs_float {name}"] = {m: z[f"{key}|{m}_corpus"] - f[f"{m}_corpus"] for m in ("qrel", "rcp")}
