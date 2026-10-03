@@ -63,6 +63,80 @@ kernel void compact(device const ushort* dist [[buffer(0)]], device uint* state 
     }
 }
 
+// ---- the float question against the page's bits, bit-serial ----
+// The question quantized to qi in [-127, 127], stored as u = qi + 128 in 8 bit-planes laid out like the codes.
+// sum_d qi_d * (+-1)_d ranks like sum_d qi_d * bit_d (the rest is a constant per question), and
+// sum_d qi_d * bit_d = sum_k 2^k popcount(plane_k & code) - 128 popcount(code): 9 AND+popcounts per page, no
+// lookups. Scores fit in [-32512, 32512]. Top-k is a two-level radix select on (score + 32768): a 256-bin
+// histogram of the high byte during the scan, then one of the low byte inside the threshold bucket only.
+// state (int): [0, 256) high-byte histogram | [256, 512) low-byte histogram | 512: bucket | 513: count above it |
+//              514: threshold | 515: candidate count | 520..: (page, score) pairs
+
+constant uint AS_HI = 0, AS_LO = 256, AS_BUCKET = 512, AS_ABOVE = 513, AS_T = 514, AS_COUNT = 515, AS_CAND = 520;
+
+inline int asym_bits_score(uint4 a, uint4 b, constant uint4* planes) {
+    int s = -128 * int(pc4(a) + pc4(b));
+    for (uint k = 0; k < 8; k++) s += int(pc4(a & planes[2 * k]) + pc4(b & planes[2 * k + 1])) << k;
+    return s;
+}
+
+kernel void asym_bits(device short* out [[buffer(0)]], device const uint4* codes [[buffer(1)]],
+                      constant uint4* planes [[buffer(2)]], device atomic_int* state [[buffer(3)]],
+                      constant uint& N [[buffer(4)]],
+                      uint i [[thread_position_in_grid]], uint t [[thread_index_in_threadgroup]],
+                      uint tg [[threads_per_threadgroup]]) {
+    threadgroup atomic_int h[256];
+    for (uint b = t; b < 256; b += tg) atomic_store_explicit(&h[b], 0, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (i < N) {
+        int s = asym_bits_score(codes[2 * i], codes[2 * i + 1], planes);
+        out[i] = short(s);
+        atomic_fetch_add_explicit(&h[uint(s + 32768) >> 8], 1, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint b = t; b < 256; b += tg) {
+        int c = atomic_load_explicit(&h[b], memory_order_relaxed);
+        if (c) atomic_fetch_add_explicit(&state[AS_HI + b], c, memory_order_relaxed);
+    }
+}
+
+// the bucket holding the k-th highest score, and how many pages are in the buckets above it
+kernel void asym_bucket(device int* state [[buffer(0)]], constant uint& K [[buffer(1)]], uint t [[thread_position_in_grid]]) {
+    if (t != 0) return;
+    int acc = 0, b = 255;
+    for (; b > 0; b--) { if (acc + state[AS_HI + b] >= int(K)) break; acc += state[AS_HI + b]; }
+    state[AS_BUCKET] = b;
+    state[AS_ABOVE] = acc;
+}
+
+kernel void asym_lo_hist(device const short* scores [[buffer(0)]], device atomic_int* state [[buffer(1)]],
+                         constant uint& N [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+    if (i >= N) return;
+    uint v = uint(int(scores[i]) + 32768);
+    if (int(v >> 8) == atomic_load_explicit(&state[AS_BUCKET], memory_order_relaxed))
+        atomic_fetch_add_explicit(&state[AS_LO + (v & 255)], 1, memory_order_relaxed);
+}
+
+// the exact threshold: the k-th highest score
+kernel void asym_threshold(device int* state [[buffer(0)]], constant uint& K [[buffer(1)]], uint t [[thread_position_in_grid]]) {
+    if (t != 0) return;
+    int need = int(K) - state[AS_ABOVE], acc = 0, b = 255;
+    for (; b > 0; b--) { acc += state[AS_LO + b]; if (acc >= need) break; }
+    state[AS_T] = ((state[AS_BUCKET] << 8) | b) - 32768;
+}
+
+kernel void asym_compact(device const short* scores [[buffer(0)]], device int* state [[buffer(1)]],
+                         constant uint& N [[buffer(2)]], constant uint& CAP [[buffer(3)]],
+                         uint i [[thread_position_in_grid]]) {
+    if (i >= N) return;
+    int s = scores[i];
+    if (s >= state[AS_T]) {
+        uint slot = atomic_fetch_add_explicit((device atomic_int*)&state[AS_COUNT], 1, memory_order_relaxed);
+        if (slot < CAP) { state[AS_CAND + 2 * slot] = int(i); state[AS_CAND + 2 * slot + 1] = s; }
+    }
+}
+
+// ---- the float question through a lookup table (the first version, kept for the benchmark) ----
 // the code is read as two uint4 (as hamming does); byte j of the page is bits 8(j%4).. of 32-bit word j/4
 // (little-endian), and lut[256 j + v] is the score of byte value v at position j
 template <typename L> inline float asym_score(uint4 a, uint4 b, L lut) {

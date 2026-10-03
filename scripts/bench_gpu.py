@@ -3,8 +3,9 @@
 The index: every embedded page's real Embed 5 code (Pro), padded with SYNTHETIC codes to N pages. The padding
 draws each bit with the real codes' per-bit frequency (independent bits), so it is labelled synthetic everywhere.
 Check: the real questions' top-100 over the padded index must equal their top-100 over the real pages alone.
-Timings per question (median of 30, synchronized; 5 warm-up runs): exact top-100 by Hamming (counting select) and
-top-100 by the float question against the bits (lookup table), against numpy (1 and 4 threads) and FAISS
+Timings per question (median of 30, synchronized; 5 warm-up runs): exact top-100 by Hamming (counting select), by
+the 8-bit float question against the bits (bit-serial, radix select) and by the first lookup-table version, against
+numpy (1 and 4 threads) and FAISS
 IndexBinaryFlat (all cores, in its own process). Writes results/bench_gpu.csv (no Embed 5 quality numbers: publishable).
 Usage: python scripts/bench_gpu.py [N ...]   (default 1000000 10000000)
 """
@@ -96,8 +97,10 @@ def main(sizes: list[int]) -> None:
                "synthetic_in_top100": intruders}
         res["gpu_hamming_top100_ms"] = statistics.median(
             timed(lambda q=q: index.topk(q, K), gpu.sync) for q in qb[:5])
-        res["gpu_asym_top100_ms"] = statistics.median(
-            timed(lambda q=q: index.asym_topk(q, K), gpu.sync) for q in qf[:5])
+        res["gpu_asym_bits_top100_ms"] = statistics.median(
+            timed(lambda q=q: index.asym_bits_topk(q, K), gpu.sync) for q in qf[:5])
+        res["gpu_asym_lut_v1_top100_ms"] = statistics.median(
+            timed(lambda q=q: index.asym_topk(q, K), gpu.sync) for q in qf[:2])
         res["gpu_scan_only_ms"] = timed(lambda: gpu.LIB.hamming(index.dist, index.codes, index._q(qb[0]), n,
                                                                 threads=n, group_size=gpu.TG), gpu.sync)
         res["gpu_scan_GBps"] = mb / 1e3 / (res["gpu_scan_only_ms"] / 1e3)

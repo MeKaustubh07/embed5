@@ -17,7 +17,8 @@ import client as ec
 MODELS = {"pro": "embed-v5.0-pro", "fast": "embed-v5.0-fast"}
 DIMS = (256, 512, 768, 1024, 1536, 2048)
 TYPES = ("float", "int8", "ubinary")
-BYTES = {"float": lambda d: 4 * d, "int8": lambda d: d, "binary": lambda d: d // 8, "binary_asym": lambda d: d // 8}
+BYTES = {"float": lambda d: 4 * d, "int8": lambda d: d, "binary": lambda d: d // 8, "binary_asym": lambda d: d // 8,
+         "binary_asym8": lambda d: d // 8}
 
 
 def cached(texts: list[str], model: str, input_type: str, dim: int = 2048, types=TYPES,
@@ -59,6 +60,15 @@ def binary_asym(qf: np.ndarray, pb: np.ndarray, d: int) -> np.ndarray:
     return renorm(qf[:, :d]) @ signs.T
 
 
+def binary_asym8(qf: np.ndarray, pb: np.ndarray, d: int) -> np.ndarray:
+    """sum_d qi_d * bit_d with the question renormalized at d and quantized to [-127, 127]: it ranks like
+    qi . (+-1) (they differ by sum(qi), a constant per question), integers like the GPU kernel's."""
+    q = renorm(qf[:, :d]).astype(np.float64)
+    qi = np.round(q / np.abs(q).max(1, keepdims=True) * 127)
+    bits = np.unpackbits(pb[:, :d // 8], axis=1).astype(np.float64)
+    return qi @ bits.T
+
+
 def int8_dot(qi: np.ndarray, pi: np.ndarray) -> np.ndarray:
     return (qi.astype(np.int32) @ pi.astype(np.int32).T).astype(np.float64)
 
@@ -71,6 +81,8 @@ def scores(precision: str, q: dict, p: dict, d: int) -> np.ndarray:
         return hamming(q["ubinary"], p["ubinary"], d)
     if precision == "binary_asym":
         return binary_asym(q["float"], p["ubinary"], d)
+    if precision == "binary_asym8":
+        return binary_asym8(q["float"], p["ubinary"], d)
     if precision == "int8":
         assert p["int8"].shape[1] == d, "a page's int8 is only read at the size it was requested"
         return renorm(q["float"][:, :d]) @ p["int8"].astype(np.float32).T
