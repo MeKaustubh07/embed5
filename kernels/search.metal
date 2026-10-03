@@ -18,6 +18,16 @@ inline uint pc4(uint4 v) { uint4 c = popcount(v); return c.x + c.y + c.z + c.w; 
 constant uint NBINS = 257;
 constant uint CAND0 = 260;      // state buffer: [0, 257) histogram | 257: threshold | 258: count | 260..: pairs
 
+// reads every code once and writes one value per SIMD group: the read-bandwidth ceiling the scans run against
+kernel void read_probe(device uint* out [[buffer(0)]], device const uint4* codes [[buffer(1)]],
+                       constant uint& N [[buffer(2)]], uint i [[thread_position_in_grid]],
+                       uint lane [[thread_index_in_simdgroup]]) {
+    uint v = 0;
+    if (i < N) v = pc4(codes[2 * i] ^ codes[2 * i + 1]);
+    v = simd_sum(v);
+    if (lane == 0) out[i / 32] = v;
+}
+
 kernel void hamming(device ushort* out [[buffer(0)]], device const uint4* codes [[buffer(1)]],
                     constant uint4* q [[buffer(2)]], constant uint& N [[buffer(3)]],
                     uint i [[thread_position_in_grid]]) {

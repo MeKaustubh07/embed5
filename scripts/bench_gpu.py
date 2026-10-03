@@ -1,20 +1,22 @@
-"""Search speed over 32-byte codes on this MacBook Air (M2, 8 GB): the Metal kernels of src/gpu.py against the CPU.
+"""Search speed over 32-byte codes on this MacBook Air (M2, 8-core GPU, 8 GB; fanless): src/gpu.py's Metal kernels
+against FAISS, the strongest CPU baselines found (scripts/bench_faiss.py), and numpy as unoptimized context.
 
-The index: every embedded page's real Embed 5 code (Pro), padded with SYNTHETIC codes to N pages. The padding
-draws each bit with the real codes' per-bit frequency (independent bits), so it is labelled synthetic everywhere.
-Check: the real questions' top-100 over the padded index must equal their top-100 over the real pages alone.
-Timings per question (median of 30, synchronized; 5 warm-up runs): exact top-100 by Hamming (counting select), by
-the 8-bit float question against the bits (bit-serial, radix select) and by the first lookup-table version, against
-numpy (1 and 4 threads) and FAISS
-IndexBinaryFlat (all cores, in its own process). Writes results/bench_gpu.csv (no Embed 5 quality numbers: publishable).
-Usage: python scripts/bench_gpu.py [N ...]   (default 1000000 10000000)
+The index: every embedded page's real Embed 5 code (Pro), padded with SYNTHETIC codes to N pages (bits drawn with
+the real codes' per-bit frequencies). The padding stands in for speed only: such codes crowd a real question's
+top-100, so nothing here says anything about search quality. Every method uses the same 5 real questions, and
+every number is a median of synchronized runs after warm-up, labelled with the questions per call ("batch").
+  GPU, batch 1      exact top-100 by Hamming (counting select); by the 8-bit float question (bit-serial, radix
+                    select), timed interleaved with Hamming (ABBA blocks) so drift does not bias their ratio
+  GPU, batch 8/32   Hamming, 8 questions per pass over the codes
+  sustained         400 Hamming calls back to back: the first 30 vs the last 100 (a fanless machine)
+  bandwidth         the Hamming scan alone, and a read-only probe kernel: the ceiling the scan runs against
+Writes results/bench_gpu.csv (speeds only: no Embed 5 quality numbers). Usage: python scripts/bench_gpu.py [N ...]
 """
 import json
 import statistics
 import subprocess
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -26,26 +28,22 @@ import data  # noqa: E402
 import gpu  # noqa: E402
 import systems as sy  # noqa: E402
 
-BANDWIDTH = 100e9                                   # M2 unified memory, bytes/s (Apple's spec)
-K, RUNS, WARMUP, QUESTIONS = 100, 30, 5, 20
+BANDWIDTH = 100e9                                   # M2 unified memory, Apple's spec, bytes/s
+K, RUNS, WARMUP, QUESTIONS = 100, 30, 5, 5
 
 
 def real_codes():
-    pages, questions = [], []
+    pages, qb, qf = [], [], []
     for s in data.DOMAINS:
-        try:
-            d = data.load(s)
-            pages.append(sy.cached(d.pages().text.tolist(), "pro", "search_document")["ubinary"][:, :32])
-            q = d.queries[d.queries.language == "english"].text.tolist()
-            questions.append(sy.cached(q, "pro", "search_query"))
-        except KeyError:
-            print(f"{s}: not fully embedded, left out")
-    return (np.concatenate(pages), np.concatenate([q["ubinary"][:, :32] for q in questions]),
-            np.concatenate([q["float"] for q in questions]))
+        d = data.load(s)
+        pages.append(sy.cached(d.pages().text.tolist(), "pro", "search_document")["ubinary"][:, :32])
+        q = sy.cached(d.queries[d.queries.language == "english"].text.tolist()[:QUESTIONS], "pro", "search_query")
+        qb.append(q["ubinary"][:, :32])
+        qf.append(q["float"])
+    return np.concatenate(pages), np.concatenate(qb), np.concatenate(qf)
 
 
 def padded(real: np.ndarray, n: int, seed: int = 0) -> np.ndarray:
-    """real codes first, then synthetic ones with the real per-bit frequencies, built in chunks."""
     p = np.unpackbits(real, axis=1).mean(0).astype(np.float32)
     rng = np.random.default_rng(seed)
     out = np.empty((n, 32), np.uint8)
@@ -56,72 +54,87 @@ def padded(real: np.ndarray, n: int, seed: int = 0) -> np.ndarray:
     return out
 
 
-def timed(fn, sync=None) -> float:
-    for _ in range(WARMUP):
+def calls(fn, runs: int = RUNS, warmup: int = WARMUP) -> list[float]:
+    for _ in range(warmup):
         fn()
     ts = []
-    for _ in range(RUNS):
-        if sync:
-            sync()
+    for _ in range(runs):
+        gpu.sync()
         t0 = time.perf_counter()
         fn()
-        if sync:
-            sync()
-        ts.append(time.perf_counter() - t0)
-    return statistics.median(ts) * 1e3
+        gpu.sync()
+        ts.append((time.perf_counter() - t0) * 1e3)
+    return ts
 
 
-def numpy_topk(codes64: np.ndarray, q64: np.ndarray, threads: int) -> np.ndarray:
-    def part(lo, hi):
-        return np.bitwise_count(codes64[lo:hi] ^ q64).sum(1, dtype=np.int32)
-    step = -(-len(codes64) // threads)
-    with ThreadPoolExecutor(threads) as ex:
-        d = np.concatenate(list(ex.map(lambda i: part(i, i + step), range(0, len(codes64), step))))
-    cut = np.argpartition(d, K)[:K + 1]
-    return cut[np.lexsort((cut, d[cut]))][:K]
+def row(method, n, batch, ms, **extra):
+    return {"method": method, "pages": n, "batch": batch, "ms_per_question": ms} | extra
+
+
+def run(n: int, real, qb, qf) -> list[dict]:
+    codes = padded(real, n)
+    ix = gpu.Index(codes)
+    rows = []
+    # batch 1, the latency case: median over the 5 questions of each question's median
+    ham = statistics.median(statistics.median(calls(lambda q=q: ix.topk(q, K))) for q in qb[:QUESTIONS])
+    rows.append(row("GPU Hamming top-100", n, 1, ham))
+    # Hamming vs the 8-bit question, interleaved A B B A so slow drift hits both alike
+    a, b = [], []
+    for rep in range(8):
+        order = ("A", "B", "B", "A") if rep % 2 == 0 else ("B", "A", "A", "B")
+        for which in order:
+            q = rep % QUESTIONS
+            if which == "A":
+                a += calls(lambda: ix.topk(qb[q], K), runs=10, warmup=2)
+            else:
+                b += calls(lambda: ix.asym_bits_topk(qf[q], K), runs=10, warmup=2)
+    rows.append(row("GPU 8-bit question top-100 (bit-serial)", n, 1, statistics.median(b),
+                    ratio_to_hamming=statistics.median(b) / statistics.median(a),
+                    ratio_p10=float(np.percentile(np.array(b) / np.array(a), 10)),
+                    ratio_p90=float(np.percentile(np.array(b) / np.array(a), 90))))
+    batch = np.concatenate([qb] * 8)[:32]
+    for nb in (8, 32):
+        t = statistics.median(calls(lambda: ix.topk_batch(batch[:nb], K), runs=10))
+        rows.append(row("GPU Hamming top-100, 8 per pass", n, nb, t / nb))
+    sus = calls(lambda: ix.topk(qb[0], K), runs=400, warmup=5)
+    rows.append(row("GPU Hamming top-100, sustained", n, 1, statistics.median(sus[-100:]),
+                    first_30_ms=statistics.median(sus[:30]), last_100_p90_ms=float(np.percentile(sus[-100:], 90))))
+    scan = statistics.median(calls(lambda: gpu.LIB.hamming(ix.dist, ix.codes, ix._q(qb[0]), n, threads=n,
+                                                            group_size=gpu.TG)))
+    probe_out = gpu.torch.empty(n // 32 + 1, dtype=gpu.torch.int32, device=gpu.DEV)
+    probe = statistics.median(calls(lambda: gpu.LIB.read_probe(probe_out, ix.codes, n, threads=n,
+                                                                group_size=gpu.TG)))
+    gb = codes.nbytes / 1e9
+    rows.append(row("GPU Hamming scan only (no top-k)", n, 1, scan, index_GBps=gb / (scan / 1e3),
+                    pct_of_spec=100 * gb / (scan / 1e3) * 1e9 / BANDWIDTH,
+                    probe_GBps=gb / (probe / 1e3), pct_of_probe=100 * probe / scan))
+    assert ix.fallbacks == 0, f"{ix.fallbacks} CPU fallbacks during timing"
+    del ix
+    c64, q64 = codes.view(np.uint64), qb[0].view(np.uint64)
+    t = statistics.median(calls(lambda: np.argpartition(np.bitwise_count(c64 ^ q64).sum(1, dtype=np.int32), K),
+                                runs=10, warmup=2))
+    rows.append(row("numpy, 1 thread (unoptimized, context only)", n, 1, t))
+    tmp = ROOT / "cache" / "bench"                  # FAISS in its own process (OpenMP clash with PyTorch)
+    tmp.mkdir(parents=True, exist_ok=True)
+    np.save(tmp / "codes.npy", codes)
+    np.save(tmp / "questions.npy", batch)
+    del codes
+    out = subprocess.run([sys.executable, str(ROOT / "scripts" / "bench_faiss.py"), str(tmp / "codes.npy"),
+                          str(tmp / "questions.npy"), str(K), str(RUNS), str(WARMUP)],
+                         capture_output=True, text=True, check=True)
+    (tmp / "codes.npy").unlink()
+    rows += [r | {"pages": n} for r in json.loads(out.stdout)]
+    return rows
 
 
 def main(sizes: list[int]) -> None:
     real, qb, qf = real_codes()
-    qb, qf = qb[:QUESTIONS], qf[:QUESTIONS]
-    base = gpu.Index(real)
-    want = [base.topk(q, K)[0] for q in qb]                       # top-100 over the real pages alone
     rows = []
     for n in sizes:
-        codes = padded(real, n)
-        index = gpu.Index(codes)
-        same = np.mean([np.array_equal(index.topk(q, K)[0], w) for q, w in zip(qb, want)])
-        intruders = np.mean([(index.topk(q, K)[0] >= len(real)).sum() for q in qb])
-        mb = codes.nbytes / 1e6
-        res = {"pages": n, "real_pages": len(real), "index_MB": mb, "real_top100_unchanged": same,
-               "synthetic_in_top100": intruders}
-        res["gpu_hamming_top100_ms"] = statistics.median(
-            timed(lambda q=q: index.topk(q, K), gpu.sync) for q in qb[:5])
-        res["gpu_asym_bits_top100_ms"] = statistics.median(
-            timed(lambda q=q: index.asym_bits_topk(q, K), gpu.sync) for q in qf[:5])
-        res["gpu_asym_lut_v1_top100_ms"] = statistics.median(
-            timed(lambda q=q: index.asym_topk(q, K), gpu.sync) for q in qf[:2])
-        res["gpu_scan_only_ms"] = timed(lambda: gpu.LIB.hamming(index.dist, index.codes, index._q(qb[0]), n,
-                                                                threads=n, group_size=gpu.TG), gpu.sync)
-        res["gpu_scan_GBps"] = mb / 1e3 / (res["gpu_scan_only_ms"] / 1e3)
-        res["gpu_scan_pct_of_bandwidth"] = 100 * res["gpu_scan_GBps"] * 1e9 / BANDWIDTH
-        del index
-        c64, q64 = codes.view(np.uint64), qb[0].view(np.uint64)
-        res["numpy_1thread_top100_ms"] = timed(lambda: numpy_topk(c64, q64, 1))
-        res["numpy_4threads_top100_ms"] = timed(lambda: numpy_topk(c64, q64, 4))
-        tmp = ROOT / "cache" / "bench"                          # FAISS runs in its own process (OpenMP clash)
-        tmp.mkdir(parents=True, exist_ok=True)
-        np.save(tmp / "codes.npy", codes)
-        np.save(tmp / "questions.npy", qb)
-        del codes
-        out = subprocess.run([sys.executable, str(ROOT / "scripts" / "bench_faiss.py"), str(tmp / "codes.npy"),
-                              str(tmp / "questions.npy"), str(K), str(RUNS), str(WARMUP)],
-                             capture_output=True, text=True, check=True)
-        res |= json.loads(out.stdout)
-        (tmp / "codes.npy").unlink()
-        res["speedup_vs_faiss"] = res["faiss_top100_ms"] / res["gpu_hamming_top100_ms"]
-        rows.append(res)
-        print({k: round(v, 3) if isinstance(v, float) else v for k, v in res.items()}, flush=True)
+        r = run(n, real, qb, qf)
+        rows += r
+        for x in r:
+            print({k: round(v, 3) if isinstance(v, float) else v for k, v in x.items()}, flush=True)
     out = ROOT / "results" / "bench_gpu.csv"
     out.parent.mkdir(exist_ok=True)
     pd.DataFrame(rows).to_csv(out, index=False)
