@@ -141,7 +141,7 @@ pages = [f"page {i} " + "x" * 8000 for i in range(120)]          # ~2,000 tokens
 emb2 = ec.Embedder(co, ec.Ledger(tmp / "ledger2.sqlite", monthly_cap=60), ec.Cache(tmp / "vectors2.sqlite"),
                    min_interval_s=0, call_token_cap=60_000)
 plan = emb2.embed(pages, **PRO, dry_run=True)
-check(plan["calls"] == 6 and plan["est_tokens"] <= 6 * 60_000,
+check(plan["calls"] == 3 and plan["est_tokens"] <= 3 * 60_000,
       "long texts are batched by estimated tokens (60k per call), not 96 at a time")
 n, t0, nslept = len(HTTP), NOW[0], len(SLEPT)
 got = emb2.embed(pages, **PRO, label="long")
@@ -149,13 +149,15 @@ rows = emb2.ledger.db.execute("SELECT status FROM calls WHERE label='long'").fet
 check(got["float"].shape == (120, 2048) and all(r == ("ok",) for r in rows),
       "240k tokens embedded with no 429: the client paces itself under the limit")
 check(NOW[0] - t0 >= 60.0 and any(s > 30 for s in SLEPT[nslept:]), "it waits for the minute window to clear")
-check(abs(emb2.chars_per_token - 8008 / 2011) < 0.05 and len(HTTP) - n < 6,
-      "it learns the real chars per token from the response, then sends fewer, fuller calls")
+ratio = 2011 / ec.raw_tokens(pages[50])                       # the fake tokenizer vs the fitted estimate
+toks = [r[0] for r in emb2.ledger.db.execute("SELECT billed_input_tokens FROM calls WHERE label='long' ORDER BY id")]
+check(abs(emb2.token_factor - 1.1 * ratio) < 0.02 and max(toks[1:]) <= 60_000,
+      f"it learns how far off its estimate runs (factor {emb2.token_factor:.2f}); later calls fit the cap for real")
 emb3 = ec.Embedder(co, ec.Ledger(tmp / "ledger3.sqlite", monthly_cap=60), ec.Cache(tmp / "vectors3.sqlite"),
                    min_interval_s=0, call_token_cap=500_000)                    # a cap far above the limit
 got = emb3.embed(pages[:96], **PRO, label="toobig")
 rows = [r[0] for r in emb3.ledger.db.execute("SELECT status FROM calls WHERE label='toobig' ORDER BY id")]
-check(got["float"].shape == (96, 2048) and rows[0] == "429" and rows[-1] == "ok" and emb3.call_token_cap < 500_000,
-      "a call refused for tokens is split more finely and completes")
-check(rows.count("429") <= 3, f"and it converges quickly ({rows.count('429')} refusals)")
+check(got["float"].shape == (96, 2048) and rows[:2] == ["429", "429"] and rows[-1] == "ok",
+      "a batch refused twice (alone over the limit) is split and completes")
+check(rows.count("429") == 2 and emb3._cap is None, "after one wait-and-retry and one split; then the cap is restored")
 print(f"{passed} checks passed")

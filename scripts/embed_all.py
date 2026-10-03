@@ -5,7 +5,7 @@ A chunk is one set x one model x one job:
   vectors    the set's pages and its questions in 6 languages, at 2048: float, int8, ubinary. Every shorter size
              and every binary code derives from these (the probe: Matryoshka prefix, binary = sign bits)
   int8-1024  the set's pages at 1024, int8 only: Embed 5's int8 cannot be derived from the float, and 1024 int8
-             (1 KB) is the setting Cohere recommends
+             (1 KB) is the setting Cohere recommends. Questions stay float: only the index is stored
 Usage:
   python scripts/embed_all.py                       status of every chunk: calls and minutes left
   python scripts/embed_all.py --next --go           run the next unfinished chunk, in the order below
@@ -22,7 +22,7 @@ import client as ec  # noqa: E402
 import data  # noqa: E402
 
 MODELS = {"pro": "embed-v5.0-pro", "fast": "embed-v5.0-fast"}
-CHARS_PER_TOKEN = {"pro": 4.72, "fast": 4.31}     # measured by the probe; start 5% below, then the client learns
+TOKEN_FACTOR = {"pro": 1.15, "fast": 1.25}        # x the fitted estimate (Fast counts ~9% more); then learned
 SETS = ("hr", "computer_science", "finance_en")    # smallest first: a whole set is ready to score early
 VECTOR_TYPES = ("float", "int8", "ubinary")
 
@@ -36,15 +36,15 @@ def work(set_name: str, job: str) -> list[tuple[list[str], str, int, tuple]]:
     """-> [(texts, input_type, dim, types)] for one chunk."""
     d = data.load(set_name)
     pages = list(dict.fromkeys(d.pages().text))
-    if job == "int8-1024":
-        return [(pages, "search_document", 1024, ("int8",))]
     questions = list(dict.fromkeys(d.queries.text))                      # all 6 languages
+    if job == "int8-1024":           # pages only: a stored index is int8, while a question is never stored
+        return [(pages, "search_document", 1024, ("int8",))]   # and stays float
     return [(pages, "search_document", 2048, VECTOR_TYPES), (questions, "search_query", 2048, VECTOR_TYPES)]
 
 
 def embedder(model: str, client=None, ledger=None, cache=None) -> ec.Embedder:
     return ec.Embedder(client if client is not None else ec.make_client(ec.load_api_key()),
-                       ledger or ec.Ledger(), cache or ec.Cache(), chars_per_token=0.95 * CHARS_PER_TOKEN[model])
+                       ledger or ec.Ledger(), cache or ec.Cache(), token_factor=TOKEN_FACTOR[model])
 
 
 def plan(emb: ec.Embedder, chunk) -> dict:
@@ -54,7 +54,8 @@ def plan(emb: ec.Embedder, chunk) -> dict:
     for texts, itype, dim, types in work(s, job):
         p = emb.embed(texts, model=MODELS[m], input_type=itype, dim=dim, types=types, dry_run=True)
         tot = {k: tot[k] + p[k] for k in tot}
-    tot["minutes"] = round(max(tot["est_tokens"] / (0.9 * emb.tokens_per_minute),
+    # measured on chunk 1: a ~70k-token call waits for the last one to leave the minute window, so ~70k a minute
+    tot["minutes"] = round(max(tot["est_tokens"] / (0.7 * emb.tokens_per_minute),
                                tot["calls"] * emb.min_interval_s / 60), 1)
     return tot
 

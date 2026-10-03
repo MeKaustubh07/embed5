@@ -11,6 +11,7 @@ Both databases live in cache/ (gitignored: the repo is public and raw Cohere out
 from __future__ import annotations
 
 import datetime as dt
+import functools
 import hashlib
 import json
 import sqlite3
@@ -31,8 +32,21 @@ DTYPES = {"float": np.float32, "int8": np.int8, "uint8": np.uint8, "binary": np.
 MONTHLY_CAP = 450                       # our hard stop: under half the trial's 1,000, leaving room for reruns
 TOKENS_PER_MINUTE = 100_000             # trial limit, undocumented: from the 429 message, 2026-10-02
 CALL_TOKEN_CAP = 80_000                 # tokens per call: one call must fit inside 90% of a minute's limit
+TOKEN_WEIGHTS = np.array([0.1411, 0.5603, 1.5028, 0.1788, 3.7576])
+"""Embed 5 tokens per letter, digit, other character (punctuation, |), whitespace, and per text. Fitted
+(non-negative least squares) to the billed tokens of 74 Pro calls on 2026-10-03: within -11% / +15% of every call,
+where one chars-per-token rate was off by -63% / +59% (tables of numbers cost ~3x the tokens of prose per char).
+Fast's tokenizer counts ~8-10% more."""
 CACHE_VERSION = 1
 _clock, _sleep = time.monotonic, time.sleep     # module-level, so tests can run the pacing on a fake clock
+
+
+@functools.lru_cache(maxsize=None)
+def raw_tokens(text: str) -> float:
+    """The fitted token estimate of one text (before the Embedder's safety factor)."""
+    letters, digits = sum(c.isalpha() for c in text), sum(c.isdigit() for c in text)
+    spaces = sum(c.isspace() for c in text)
+    return float(np.array([letters, digits, len(text) - letters - digits - spaces, spaces, 1.0]) @ TOKEN_WEIGHTS)
 
 
 class BudgetExhausted(RuntimeError):
@@ -40,7 +54,7 @@ class BudgetExhausted(RuntimeError):
 
 
 class _Rebatch(Exception):
-    """A call was refused for the token limit: halve the tokens per call and split what is still missing."""
+    """A batch was refused twice for the token limit: split it and plan the rest again."""
 
 
 def load_api_key(env_path: Path = ROOT / ".env") -> str:
@@ -145,21 +159,25 @@ class Embedder:
     raw_dir: Path | None = None           # keep each response's raw JSON (the probe)
     tokens_per_minute: int = TOKENS_PER_MINUTE
     call_token_cap: int = CALL_TOKEN_CAP
-    chars_per_token: float = 3.0          # cautious until a response reports real counts (then the lowest seen)
+    token_factor: float = 1.15            # x raw_tokens; after each call, 1.1 x the worst actual/estimate of the last 20
     _last: float = 0.0
     _sent: list = None                    # (time, tokens) of the calls in the last minute
-    _observed: float | None = None        # chars per token, lowest measured so far
+    _ratios: list = None                  # actual / raw_tokens of each call so far
+    _cap: int | None = None               # a smaller cap for the next batch, after a batch was refused twice
 
     def est_tokens(self, text: str) -> int:
-        return int(len(text) / self.chars_per_token) + 8          # + the model's own special tokens
+        return int(self.token_factor * raw_tokens(text)) + 1
 
-    def _batches(self, texts: list[str]) -> list[list[str]]:
-        """Greedy: up to 96 texts and call_token_cap estimated tokens per call."""
+    def _batches(self, texts: list[str], first_only: bool = False) -> list[list[str]]:
+        """Greedy: up to 96 texts and the token cap (estimated) per call."""
+        cap = self._cap or self.call_token_cap
         out, cur, tok = [], [], 0
         for t in texts:
             n = self.est_tokens(t)
-            if cur and (len(cur) == MAX_TEXTS_PER_CALL or tok + n > self.call_token_cap):
+            if cur and (len(cur) == MAX_TEXTS_PER_CALL or tok + n > cap):
                 out.append(cur)
+                if first_only:
+                    return out
                 cur, tok = [], 0
             cur.append(t)
             tok += n
@@ -190,11 +208,11 @@ class Embedder:
             return {"calls": len(self._batches(missing)), "texts": len(missing),
                     "est_tokens": sum(self.est_tokens(t) for t in missing)}
         while missing:                    # plan one call at a time: each uses the latest token estimate
-            batch = self._batches(missing)[0]
+            batch = self._batches(missing, first_only=True)[0]
             try:
                 self._call(batch, model, input_type, dim, list(types), keys, label)
             except _Rebatch:
-                continue                  # the cap was halved: the next batch is smaller
+                continue                  # the next batch is planned under the smaller cap
             sent = set(batch)
             missing = [t for t in missing if t not in sent]
         return {e: np.stack([self.cache.get(keys[(t, e)], e) for t in texts]) for e in types}
@@ -221,8 +239,10 @@ class Embedder:
                 if any(w in str(ex.body).lower() for w in ("month", "quota")):   # waiting will not help
                     raise BudgetExhausted(f"Cohere refused the call for a quota: {str(ex.body)[:300]}") from ex
                 _sleep(min(float(ra), 300.0) if ra and ra.strip().isdigit() else 61.0)
-                if "token" in str(ex.body).lower() and len(batch) > 1:   # this batch alone may be over the limit
-                    self.call_token_cap = max(1_000, self.call_token_cap // 2)
+                # a token refusal usually means the minute was full: retry once after the wait; refused again with
+                # the minute empty, the batch alone is too big, so split it (the normal cap returns after a success)
+                if "token" in str(ex.body).lower() and len(batch) > 1 and attempt >= 2:
+                    self._cap = max(1_000, est // 2)
                     raise _Rebatch from ex
                 continue
             except (httpx.TimeoutException, httpx.TransportError) as ex:
@@ -250,14 +270,12 @@ class Embedder:
         av = getattr(m, "api_version", None)
         counted = max(getattr(bu, "input_tokens", None) or 0,
                       getattr(getattr(m, "tokens", None), "input_tokens", None) or 0)
-        chars = sum(len(t) for t in batch)
         if counted and self._sent:                   # the minute window counts what the server counted
             self._sent[-1] = (self._sent[-1][0], max(self._sent[-1][1], int(counted)))
-        if counted and chars >= 500 * len(batch):    # learn the real rate from page-length texts only: on short
-            seen = chars / counted                   # questions each text's fixed token overhead dominates
-            # keep the densest rate seen (most tokens per char), so estimates stay on the cautious side
-            self.chars_per_token = seen if self._observed is None else min(self._observed, seen)
-            self._observed = self.chars_per_token
+        if counted:                                  # learn how far off the estimate runs for this model and text
+            self._ratios = (self._ratios or []) + [counted / sum(raw_tokens(t) for t in batch)]
+            self.token_factor = 1.1 * max(self._ratios[-20:])
+        self._cap = None
         self.ledger.finish(
             cid, status="ok", http_status=200, latency_s=round(_clock() - t0, 3), response_id=r.id,
             billed_input_tokens=getattr(bu, "input_tokens", None),

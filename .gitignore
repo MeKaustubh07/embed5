@@ -21,3 +21,6 @@ __pycache__/
 *.pyc
 *.log
 .DS_Store
+
+# results with Embed 5 quality numbers: kept local until Cohere says publishing them is fine
+results/
