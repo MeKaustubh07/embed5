@@ -58,7 +58,7 @@ def contrasts(z: dict) -> dict[str, dict[str, np.ndarray]]:
              "int8_1024": "pro|pro|single|int8|1024||0"}
     for key in [k[:-len("|qrel_corpus")] for k in z if k.endswith("|qrel_corpus") and "|two-stage|" in k]:
         _, _, _, prec, d, rescorer, depth = key.split("|")
-        name = f"{prec}{d} -> {rescorer} top {depth}"
+        name = f"{prec}{'_' if prec[-1].isdigit() else ''}{d} -> {rescorer} top {depth}"   # binary_asym8_256
         out[f"vs_float {name}"] = {m: z[f"{key}|{m}_corpus"] - f[f"{m}_corpus"] for m in ("qrel", "rcp")}
         # against the re-scorer scoring every page: what the first pass alone costs
         out[f"vs_rescorer {name}"] = {m: z[f"{key}|{m}_corpus"] - z[f"{alone[rescorer]}|{m}_corpus"]
