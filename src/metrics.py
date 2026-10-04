@@ -7,8 +7,9 @@ Two protocols, for the question this project asks:
              chart measures: re-ordering a shortlist that other search systems picked.
   corpus     rcp-ndcg's "plain" protocol: every page of the set is ranked, and a page outside the pool has gain 0.
              With no shortlist, a page the pool never saw can take a top-10 slot. For RCP-nDCG that is a lower
-             bound (such a page could still be relevant); for qrel-nDCG (human grades) it is exact, because every
-             page a human marked relevant is in the pool.
+             bound (such a page could still be relevant); for qrel-nDCG (human grades) it is exact relative to ViDoRe's
+             labels, because every page marked relevant is in the pool (the labels were pre-filtered by a VLM, then
+             human-reviewed, so they are not exhaustive).
 Recall@k counts the human-relevant pages in the top k, a tie straddling the cutoff counted fractionally (the
 expected recall over the tie's orders).
 """

@@ -4,7 +4,7 @@ For each set and language, every embedded (index model, question model) pair:
   single     the index as float / binary (Hamming) / binary_asym (float question vs the page's bits) at every dim,
              and as the API's int8 at 2048 and 1024 (float question vs int8 page)
   two-stage  a first pass over every page (32 B Hamming, 32 B binary_asym with the float or the 8-bit question, 128 B
-             Hamming) keeps the top `depth`
+             Hamming) keeps the top `depth` (ties at the cut in random order, averaged over TIE_SEEDS orders)
              pages, which a bigger vector re-scores (float 2048, int8 2048, int8 1024). Depths are page counts and
              shares of the set (the share is what carries to a bigger collection)
 Metrics (src/metrics.py): RCP- and qrel-nDCG@10 with the shortlist and over the corpus, never-judged pages in the
@@ -33,6 +33,7 @@ FIRST_PASSES = {"binary256": ("binary", 256), "binary_asym256": ("binary_asym", 
 RESCORE_BYTES = {"float2048": 8192, "int8_2048": 2048, "int8_1024": 1024}
 DEPTHS = (10, 20, 50, 100, 200)
 DEPTH_SHARES = (0.01, 0.02, 0.05, 0.10)
+TIE_SEEDS = 3                              # two-stage: per-question metrics averaged over random tie orders at the cut
 
 
 def try_cached(texts, model, input_type, dim=2048, types=sy.TYPES):
@@ -43,7 +44,8 @@ def try_cached(texts, model, input_type, dim=2048, types=sy.TYPES):
 
 
 def systems_for(P: dict, Q: dict, P1k: dict, n_pages: int, two_stage: bool = True):
-    """-> [(row fields, build())] for one set and language; builds share their score matrices."""
+    """-> [(row fields, build(seed))] for one set and language; builds share their score matrices, and only a
+    two-stage build depends on the seed (its random tie order at the cut)."""
     @cache
     def single(ip, qm, prec, d):
         if prec == "int8" and d == 1024:
@@ -61,7 +63,7 @@ def systems_for(P: dict, Q: dict, P1k: dict, n_pages: int, two_stage: bool = Tru
             cells += [("int8", 1024)] if ip in P1k else []
             for prec, d in cells:
                 out.append((base | {"kind": "single", "precision": prec, "dim": d, "ram_bytes": sy.BYTES[prec](d)},
-                            lambda ip=ip, qm=qm, prec=prec, d=d: single(ip, qm, prec, d)))
+                            lambda seed, ip=ip, qm=qm, prec=prec, d=d: single(ip, qm, prec, d)))
             if not two_stage:
                 continue
             rs = rescorers | ({"int8_1024": ("int8", 1024)} if ip in P1k else {})
@@ -71,8 +73,8 @@ def systems_for(P: dict, Q: dict, P1k: dict, n_pages: int, two_stage: bool = Tru
                         out.append(({"index": ip, "query": qm, "kind": "two-stage", "precision": fprec, "dim": fd,
                                      "ram_bytes": sy.BYTES[fprec](fd), "rescorer": rname,
                                      "disk_bytes": RESCORE_BYTES[rname], "depth": n},
-                                    lambda ip=ip, qm=qm, fprec=fprec, fd=fd, rprec=rprec, rd=rd, n=n: sy.two_stage(
-                                        single(ip, qm, fprec, fd), single(ip, qm, rprec, rd), n)))
+                                    lambda seed, ip=ip, qm=qm, fprec=fprec, fd=fd, rprec=rprec, rd=rd, n=n:
+                                    sy.two_stage(single(ip, qm, fprec, fd), single(ip, qm, rprec, rd), n, seed)))
     return out
 
 
@@ -92,9 +94,12 @@ def run_set(name: str) -> list[dict]:
             qs = metrics.QuerySet.load(name, lang, d, judged_by=judge)
             per_query = {"__query_ids__": np.array(qs.query_ids), "__en_ids__": np.array(qs.en_ids)}
             for fields, build in systems_for(P, Q, P1k, len(pages), two_stage=judge is None):
-                m = metrics.evaluate(build(), qs)
-                if fields["kind"] == "two-stage":           # the shortlist protocol does not apply to a first pass
-                    m["rcp_shortlist"][:] = m["qrel_shortlist"][:] = np.nan
+                if fields["kind"] == "two-stage":           # averaged over random tie orders at the cut
+                    runs = [metrics.evaluate(build(seed), qs) for seed in range(TIE_SEEDS)]
+                    m = {k: np.mean([r[k] for r in runs], axis=0) for k in runs[0]}
+                    m["rcp_shortlist"][:] = m["qrel_shortlist"][:] = np.nan   # no shortlist protocol for a first pass
+                else:
+                    m = metrics.evaluate(build(0), qs)
                 key = "|".join(str(fields[k]) for k in ("index", "query", "kind", "precision", "dim", "rescorer",
                                                        "depth"))
                 per_query |= {f"{key}|{k}": v for k, v in m.items()}

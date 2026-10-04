@@ -36,7 +36,9 @@ def cached(texts: list[str], model: str, input_type: str, dim: int = 2048, types
 
 
 def renorm(x: np.ndarray) -> np.ndarray:
-    x = x.astype(np.float32)
+    """Rows scaled to unit length, in float64: in float32, pages whose scores differ by ~1e-7 tie (or swap), and a tie
+    changes nDCG under the group-mean rule."""
+    x = x.astype(np.float64)
     return x / np.linalg.norm(x, axis=1, keepdims=True)
 
 
@@ -47,7 +49,7 @@ def cosine(qf: np.ndarray, pf: np.ndarray, d: int) -> np.ndarray:
 def hamming(qb: np.ndarray, pb: np.ndarray, d: int, rows: int = 64) -> np.ndarray:
     """Minus the Hamming distance between d-bit codes (ubinary bytes): higher = more similar, integers."""
     q, p = qb[:, :d // 8], pb[:, :d // 8]
-    out = np.empty((len(q), len(p)), np.float32)
+    out = np.empty((len(q), len(p)), np.float64)
     for i in range(0, len(q), rows):                               # bounds the [rows, pages, bytes] XOR
         # sum into int32: the counts are uint8, and negating an unsigned sum wraps around instead
         out[i:i + rows] = -np.bitwise_count(q[i:i + rows, None, :] ^ p[None, :, :]).sum(-1, dtype=np.int32)
@@ -56,20 +58,20 @@ def hamming(qb: np.ndarray, pb: np.ndarray, d: int, rows: int = 64) -> np.ndarra
 
 def binary_asym(qf: np.ndarray, pb: np.ndarray, d: int) -> np.ndarray:
     """The float question (renormalized at d) against the page's bits read as +-1."""
-    signs = np.unpackbits(pb[:, :d // 8], axis=1).astype(np.float32) * 2 - 1
+    signs = np.unpackbits(pb[:, :d // 8], axis=1).astype(np.float64) * 2 - 1
     return renorm(qf[:, :d]) @ signs.T
 
 
 def quantize(qf: np.ndarray, d: int = 256) -> np.ndarray:
-    """Questions [n, >= d] renormalized at d (in float64) and quantized to integers in [-127, 127], int32 [n, d].
-    The one quantizer of both the CPU reference and the GPU kernel: a float32 renormalization rounds 45 of the
-    5,052 real questions to a different integer somewhere."""
+    """Questions [n, >= d] (their first d values; the length cancels) as integers round(x * 127 / max|x|) in
+    [-127, 127], int32 [n, d]: the one quantizer of the CPU reference and the GPU kernel. For float32 inputs x * 127
+    is exact in float64 and one correctly rounded division lands on a half only when the true value is a half, so
+    halves round to even exactly as in exact arithmetic (tests/test_systems.py checks against fractions)."""
     q = np.atleast_2d(qf)[:, :d].astype(np.float64)
-    norm = np.linalg.norm(q, axis=1, keepdims=True)
-    if (norm == 0).any():
+    top = np.abs(q).max(1, keepdims=True)
+    if (top == 0).any():
         raise ValueError("a question vector of all zeros has no direction")
-    q = q / norm
-    return np.round(q / np.abs(q).max(1, keepdims=True) * 127).astype(np.int32)
+    return np.round(q * 127 / top).astype(np.int32)
 
 
 def binary_asym8(qf: np.ndarray, pb: np.ndarray, d: int) -> np.ndarray:
@@ -95,15 +97,17 @@ def scores(precision: str, q: dict, p: dict, d: int) -> np.ndarray:
         return binary_asym8(q["float"], p["ubinary"], d)
     if precision == "int8":
         assert p["int8"].shape[1] == d, "a page's int8 is only read at the size it was requested"
-        return renorm(q["float"][:, :d]) @ p["int8"].astype(np.float32).T
+        return renorm(q["float"][:, :d]) @ p["int8"].astype(np.float64).T
     raise ValueError(precision)
 
 
-def two_stage(first: np.ndarray, rescore: np.ndarray, n: int) -> np.ndarray:
+def two_stage(first: np.ndarray, rescore: np.ndarray, n: int, seed: int = 0) -> np.ndarray:
     """A first pass keeps each question's top n pages, the rescore orders them; every kept page ranks above every
-    dropped one, which keeps its first-pass score. Ties at the cut are broken by page index (corpus order, which
-    carries no relevance), so exactly n pages are rescored."""
-    keep = np.argsort(-first, axis=1, kind="stable")[:, :n]
+    dropped one, which keeps its first-pass score. Exactly n pages are rescored: ties at the cut (common with integer
+    Hamming scores) are broken at random, seeded, since page order is not a neutral choice; scripts/evaluate.py
+    averages over several seeds."""
+    tiebreak = np.random.default_rng(seed).random(first.shape)
+    keep = np.lexsort((tiebreak, -first), axis=-1)[:, :n]
     rows = np.arange(len(first))[:, None]
     first, rescore = first.astype(np.float64), rescore.astype(np.float64)
     out = first - first.max() - 1.0                       # dropped pages: <= -1, in first-pass order

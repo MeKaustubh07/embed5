@@ -1,7 +1,8 @@
 """95% confidence intervals for the contrasts "32 Bytes" reports, from the per-question values of
 scripts/evaluate.py (cache/eval/*.npz). Paired bootstrap, 10,000 resamples, fixed seed. A question and its five
 translations are one cluster (en_id): resampling them as independent rows would make the intervals 1.4-2x too
-narrow. "all languages" averages each cluster over its languages, then the clusters.
+narrow. "all languages" averages each cluster over its languages, then the clusters. "Exact" below means exact
+relative to ViDoRe's labels (VLM-pre-filtered, then human-reviewed; not exhaustive).
 
 Contrasts (per set):
   gap        shortlist minus corpus nDCG@10 of one index (how much the shortlist flatters it); the corpus RCP counts
@@ -10,6 +11,7 @@ Contrasts (per set):
   vs_float   a system's corpus nDCG@10 minus the full-float index's (two-stage and binary_asym rows)
   vs_rescorer a two-stage system minus its re-scorer scoring every page: the cost of the first pass alone
   mix        an (index model, question model) pair minus Pro index + Pro question at the same storage
+  paired     int8 vs float at the same length; the 8-bit vs the float question (alone and before each re-check)
 Writes results/stats.csv. Usage: python scripts/stats.py [set ...]
 """
 import sys
@@ -47,14 +49,22 @@ def contrasts(z: dict) -> dict[str, dict[str, np.ndarray]]:
     """-> {contrast name: {metric: per-question values}} for one subset (Pro index, Pro questions)."""
     out = {}
     f = {m: z[f"{FLOAT}|{m}"] for m in ("qrel_shortlist", "qrel_corpus", "rcp_shortlist", "rcp_corpus")}
-    for prec, d in (("float", 2048), ("int8", 2048), ("binary", 2048), ("binary", 1024), ("binary", 512),
-                    ("binary", 256), ("binary_asym", 256), ("binary_asym8", 256)):
+    for prec, d in (("float", 2048), ("int8", 2048), ("int8", 1024), ("binary", 2048), ("binary", 1024),
+                    ("binary", 512), ("binary", 256), ("binary_asym", 256), ("binary_asym8", 256)):
         k = f"pro|pro|single|{prec}|{d}||0"
         for m in ("qrel", "rcp"):
             gap = z[f"{k}|{m}_shortlist"] - z[f"{k}|{m}_corpus"]
             out.setdefault(f"gap {prec} {d}", {})[m] = gap
             out.setdefault(f"gap_excess {prec} {d}", {})[m] = gap - (f[f"{m}_shortlist"] - f[f"{m}_corpus"])
             out.setdefault(f"vs_float {prec} {d}", {})[m] = z[f"{k}|{m}_corpus"] - f[f"{m}_corpus"]
+    # int8 against float at the same length, and the 8-bit question against the float question (paired, same pages)
+    pairs = [("int8 1024 vs float 1024", "pro|pro|single|int8|1024||0", "pro|pro|single|float|1024||0"),
+             ("int8 2048 vs float 2048", "pro|pro|single|int8|2048||0", FLOAT),
+             ("8-bit question vs float question, 32 B", "pro|pro|single|binary_asym8|256||0",
+              "pro|pro|single|binary_asym|256||0")]
+    for name, a, b in pairs:
+        if f"{a}|qrel_corpus" in z:
+            out[name] = {m: z[f"{a}|{m}_corpus"] - z[f"{b}|{m}_corpus"] for m in ("qrel", "rcp")}
     # Pro/Fast mixing: each (index, question) model pair minus Pro index + Pro question, at the same storage
     for prec, d in (("float", 2048), ("int8", 2048), ("float", 256), ("binary", 2048), ("binary", 1024),
                     ("binary", 256), ("binary_asym8", 256)):
@@ -74,6 +84,10 @@ def contrasts(z: dict) -> dict[str, dict[str, np.ndarray]]:
         # against the re-scorer scoring every page: what the first pass alone costs
         out[f"vs_rescorer {name}"] = {m: z[f"{key}|{m}_corpus"] - z[f"{alone[rescorer]}|{m}_corpus"]
                                       for m in ("qrel", "rcp")}
+        if prec == "binary_asym8":                 # the 8-bit question against the float question, same re-check
+            twin = key.replace("|binary_asym8|", "|binary_asym|")
+            out[f"8-bit vs float question, {name}"] = {m: z[f"{key}|{m}_corpus"] - z[f"{twin}|{m}_corpus"]
+                                                       for m in ("qrel", "rcp")}
     return out
 
 
