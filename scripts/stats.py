@@ -1,8 +1,9 @@
 """95% confidence intervals for the contrasts "32 Bytes" reports, from the per-question values of
 scripts/evaluate.py (cache/eval/*.npz). Paired bootstrap, 10,000 resamples, fixed seed. A question and its five
-translations are one cluster (en_id): resampling them as independent rows would make the intervals 1.4-2x too
-narrow. "all languages" averages each cluster over its languages, then the clusters. "Exact" below means exact
-relative to ViDoRe's labels (VLM-pre-filtered, then human-reviewed; not exhaustive).
+translations are one cluster (en_id): a translation is not an independent question, so resampling them as
+independent rows would make the intervals too narrow. "all languages" averages each cluster over its languages,
+then the clusters. "Exact" below means exact relative to ViDoRe's labels (VLM-pre-filtered, then human-reviewed;
+not exhaustive).
 
 Contrasts (per set):
   gap        shortlist minus corpus nDCG@10 of one index (how much the shortlist flatters it); the corpus RCP counts

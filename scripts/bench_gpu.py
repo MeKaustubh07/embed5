@@ -2,9 +2,9 @@
 against FAISS, the strongest CPU baselines found (scripts/bench_faiss.py), and numpy as unoptimized context.
 
 The index: every embedded page's real Embed 5 code (Pro), padded with SYNTHETIC codes to N pages (bits drawn with
-the real codes' per-bit frequencies). The padding stands in for speed only: such codes crowd a real question's
-top-100, so nothing here says anything about search quality. Every method uses the same 5 real questions, and
-every number is a median of synchronized runs after warm-up, labelled with the questions per call ("batch").
+the real codes' per-bit frequencies). The padding stands in for speed only: nothing here says anything about
+search quality. Every method uses the same real questions (5 one at a time; the same 8 or 32 per call in batches),
+and every number is a median of synchronized runs after warm-up, labelled with the questions per call ("batch").
   GPU, batch 1      exact top-100 by Hamming (counting select); by the 8-bit float question (bit-serial, radix
                     select), timed interleaved with Hamming (ABBA blocks) so drift does not bias their ratio
   GPU, batch 8/32   Hamming, 8 questions per pass over the codes

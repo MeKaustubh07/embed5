@@ -1,6 +1,6 @@
 """src/metrics.py against Cohere's rcp-ndcg: (1) query by query against rcp_ndcg_core.protocol.score_query on
 random cases, including the heavy ties of binary (Hamming) scores; (2) Cohere's stored runs reproduce the numbers
-rcp-ndcg's CLI reports. Part 2 reads the stored runs from the Hugging Face cache (downloads ~18 MB once).
+rcp-ndcg's CLI reports. Part 2 reads the stored runs from the Hugging Face cache (downloaded once).
 Run: .venv/bin/python tests/test_metrics.py"""
 import os
 import sys

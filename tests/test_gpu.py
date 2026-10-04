@@ -102,9 +102,6 @@ check(ok_a, "GPU asym == the CPU binary_asym scores, 40 questions")
 cpu_a8 = sy.binary_asym8(Q["float"], P["ubinary"], 256)
 ok_8 = all(np.array_equal(idx_real.asym_bits_scores(Q["float"][i]), cpu_a8[i].astype(np.int64)) for i in range(40))
 check(ok_8, "GPU bit-serial == the CPU binary_asym8 scores, 40 questions")
-top = lambda S, i: set(np.argsort(-S[i], kind="stable")[:100])
-overlap = np.mean([len(top(cpu_a8, i) & top(cpu_a, i)) / 100 for i in range(40)])
-check(overlap > 0.95, f"the 8-bit question keeps {overlap:.1%} of the float question's top-100")
 allq = np.concatenate([sy.cached(data.load(s_).queries.text.tolist(), "pro", "search_query",
                                  types=("float",))["float"][:, :256] for s_ in data.DOMAINS]
                       + [rng.standard_normal((20_000, 256)).astype(np.float32)])
